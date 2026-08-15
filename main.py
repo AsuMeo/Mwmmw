@@ -295,6 +295,27 @@ def get_long_poll_server():
         return resp["response"]
     return None
 
+# ============ ЗАЩИТА ОТ СПАМА ============
+START_TIME = int(time.time())
+PROCESSED_MSGS = set()  # Хеши обработанных сообщений
+
+def msg_hash(peer_id, text, ts_approx):
+    """Уникальный хеш сообщения для защиты от дублей"""
+    return hash(f"{peer_id}:{text}:{ts_approx}")
+
+def is_spam_risk(peer_id, text):
+    """Проверяем, не спамим ли мы"""
+    # Проверяем, не отвечали ли уже на это
+    msg_id = msg_hash(peer_id, text, int(time.time() / 10))
+    if msg_id in PROCESSED_MSGS:
+        log.warning(f"⚠️ Дубль сообщения, пропускаем: {text[:30]}")
+        return True
+    PROCESSED_MSGS.add(msg_id)
+    # Ограничиваем размер памяти
+    if len(PROCESSED_MSGS) > 1000:
+        PROCESSED_MSGS.clear()
+    return False
+
 def listen_messages(user_id):
     server_data = get_long_poll_server()
     if not server_data:
@@ -307,7 +328,11 @@ def listen_messages(user_id):
     key = server_data["key"]
 
     log.info(f"✅ Бот запущен! Жду сообщений от ID={user_id}")
-    log.info("Отправь 'помощь' в чат с самим собой")
+    log.info(f"⏱ Время запуска: {START_TIME}")
+    log.info("💡 Отправь 'помощь' в чат с самим собой")
+
+    # Пропускаем первую порцию старых сообщений
+    first_run = True
 
     while True:
         try:
@@ -331,16 +356,41 @@ def listen_messages(user_id):
 
             ts = data["ts"]
 
+            # Первый запуск — пропускаем ВСЕ старые сообщения
+            if first_run:
+                first_run = False
+                old_count = len(data.get("updates", []))
+                if old_count > 0:
+                    log.info(f"🗑 Пропущено {old_count} старых сообщений (защита от спама)")
+                continue
+
             for update in data.get("updates", []):
-                if update[0] == 4:
+                if update[0] == 4:  # Новое сообщение
                     flags = update[2]
                     peer_id = update[3]
+                    ts_msg = update[4]  # Временная метка сообщения
                     text = update[5]
 
+                    # ИСХОДЯЩИЕ — пропускаем (это наши ответы)
                     if flags & 2:
                         continue
 
+                    # Только чат с собой
                     if peer_id != user_id:
+                        continue
+
+                    # ЗАЩИТА 1: Сообщение старше запуска бота
+                    if ts_msg < START_TIME - 60:  # Допуск 60 сек на рассинхрон
+                        log.info(f"🗑 Старое сообщение пропущено ({ts_msg} < {START_TIME}): {text[:30]}")
+                        continue
+
+                    # ЗАЩИТА 2: Дубли
+                    if is_spam_risk(peer_id, text):
+                        continue
+
+                    # ЗАЩИТА 3: Не отвечаем на свои же сообщения (по тексту)
+                    if text.startswith("🔍") or text.startswith("📋") or text.startswith("🐱") or text.startswith("🐕") or text.startswith("🌤") or text.startswith("💰") or text.startswith("😂") or text.startswith("📰") or text.startswith("🧠") or text.startswith("🔄") or text.startswith("🌐") or text.startswith("📖") or text.startswith("❌"):
+                        log.info(f"🗑 Это наше сообщение, пропускаем: {text[:30]}")
                         continue
 
                     log.info(f"📩 Запрос: {text[:50]}")
