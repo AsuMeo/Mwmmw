@@ -238,6 +238,9 @@ def process_command(peer_id, text):
                 "🧠 `факт` — случайный факт\n"
                 "🔄 `перевод <текст>` — перевод на английский\n"
                 "🌐 `ip` — информация о IP\n"
+                "\n📤 TG-пост:\n`-100xxx\nbot_token\nТекст поста`\n"
+                "\n⏸ `стоп` — остановить бота\n"
+                "▶️ `старт` — запустить бота\n"
                 "\n💡 Любой другой текст — поиск в интернете")
 
     if text_lower.startswith("поиск ") or text_lower.startswith("search "):
@@ -297,7 +300,10 @@ def get_long_poll_server():
 
 # ============ ЗАЩИТА ОТ СПАМА ============
 START_TIME = int(time.time())
-PROCESSED_MSGS = set()  # Хеши обработанных сообщений
+PROCESSED_MSGS = set()
+BOT_PAUSED = False  # Состояние паузы
+TG_PROCESSED = set()  # Хеши обработанных TG-постов
+TG_START_TIME = START_TIME  # Хеши обработанных сообщений
 
 def msg_hash(peer_id, text, ts_approx):
     """Уникальный хеш сообщения для защиты от дублей"""
@@ -315,6 +321,120 @@ def is_spam_risk(peer_id, text):
     if len(PROCESSED_MSGS) > 1000:
         PROCESSED_MSGS.clear()
     return False
+
+# ============ TELEGRAM POSTING ============
+
+def parse_tg_post(text):
+    """Парсит формат: chat_id\ntoken\nсообщение"""
+    lines = text.strip().split("\n")
+    if len(lines) < 3:
+        return None
+
+    chat_id = lines[0].strip()
+    token = lines[1].strip()
+    message = "\n".join(lines[2:]).strip()
+
+    # Валидация chat_id (должен быть число или @username)
+    if not chat_id:
+        return None
+    if chat_id.startswith("-"):
+        try:
+            int(chat_id)
+        except:
+            return None
+
+    # Валидация токена (должен содержать двоеточие)
+    if ":" not in token or len(token) < 20:
+        return None
+
+    return {"chat_id": chat_id, "token": token, "message": message}
+
+def send_tg_message(chat_id, token, text):
+    """Отправляет сообщение в Telegram"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        data = r.json()
+        if data.get("ok"):
+            return True, None
+        return False, data.get("description", "Unknown error")
+    except Exception as e:
+        return False, str(e)
+
+def send_tg_photo(chat_id, token, photo_url, caption=""):
+    """Отправляет фото в Telegram по URL"""
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    payload = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption,
+        "parse_mode": "HTML"
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        data = r.json()
+        if data.get("ok"):
+            return True, None
+        return False, data.get("description", "Unknown error")
+    except Exception as e:
+        return False, str(e)
+
+def handle_tg_post(peer_id, text):
+    """Обрабатывает TG-пост с защитой от спама"""
+    global TG_PROCESSED, TG_START_TIME
+
+    # Защита 1: проверяем не обрабатывали ли уже
+    post_hash = hash(text.strip()[:200])
+    if post_hash in TG_PROCESSED:
+        log.warning("⚠️ TG-пост уже обрабатывался, пропускаем")
+        return None
+    TG_PROCESSED.add(post_hash)
+    if len(TG_PROCESSED) > 500:
+        TG_PROCESSED.clear()
+
+    parsed = parse_tg_post(text)
+    if not parsed:
+        return "❌ Неверный формат. Пример:\n-1003402995613\n8476739947:AAHP...\nПривет, мяу"
+
+    chat_id = parsed["chat_id"]
+    token = parsed["token"]
+    message = parsed["message"]
+
+    log.info(f"📤 TG-пост в {chat_id}: {message[:40]}...")
+
+    # Отправляем
+    ok, err = send_tg_message(chat_id, token, message)
+
+    if ok:
+        log.info(f"✅ TG-пост отправлен в {chat_id}")
+        return f"✅ Пост отправлен в канал {chat_id}\n\n📝 {message[:100]}"
+    else:
+        log.error(f"❌ TG ошибка: {err}")
+        return f"❌ Ошибка Telegram:\n{err}"
+
+# ============ ПАУЗА / СТАРТ ============
+
+def handle_pause(peer_id, text_lower):
+    """Обрабатывает стоп/старт"""
+    global BOT_PAUSED
+
+    if text_lower == "стоп" or text_lower == "stop":
+        BOT_PAUSED = True
+        log.info("⏸ Бот приостановлен")
+        return "⏸ Бот остановлен. Напиши 'старт' чтобы продолжить."
+
+    if text_lower == "старт" or text_lower == "start":
+        BOT_PAUSED = False
+        log.info("▶️ Бот возобновлён")
+        return "▶️ Бот запущен! Отправь 'помощь' для списка команд."
+
+    return None
 
 def listen_messages(user_id):
     server_data = get_long_poll_server()
