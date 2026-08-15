@@ -326,81 +326,71 @@ def is_spam_risk(peer_id, text):
 
 def parse_tg_post(text):
     """Парсит формат: chat_id\ntoken\nсообщение"""
-    raw_lines = text.strip().splitlines()
-    lines = [l.strip() for l in raw_lines if l.strip()]
-
+    lines = text.strip().split("\n")
     if len(lines) < 3:
         return None
 
-    chat_id_raw = lines[0].strip()
+    chat_id = lines[0].strip()
     token = lines[1].strip()
     message = "\n".join(lines[2:]).strip()
 
-    # Валидация chat_id
-    chat_id = None
-    if chat_id_raw.startswith("-100"):
-        try:
-            chat_id = int(chat_id_raw)
-        except:
-            pass
-    elif chat_id_raw.startswith("-"):
-        try:
-            chat_id = int(chat_id_raw)
-        except:
-            pass
-    elif chat_id_raw.startswith("@"):
-        chat_id = chat_id_raw  # @username
-    else:
-        try:
-            chat_id = int(chat_id_raw)
-        except:
-            pass
-
-    if chat_id is None:
+    # Валидация chat_id (должен быть число или @username)
+    if not chat_id:
         return None
+    if chat_id.startswith("-"):
+        try:
+            int(chat_id)
+        except:
+            return None
 
-    # Валидация токена
+    # Валидация токена (должен содержать двоеточие)
     if ":" not in token or len(token) < 20:
         return None
 
     return {"chat_id": chat_id, "token": token, "message": message}
 
-def send_tg_request(token, method, payload):
-    """Универсальный запрос к Telegram Bot API"""
-    url = f"https://api.telegram.org/bot{token}/{method}"
+def send_tg_message(chat_id, token, text):
+    """Отправляет сообщение в Telegram"""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
     try:
         r = requests.post(url, json=payload, timeout=30)
         data = r.json()
         if data.get("ok"):
             return True, None
-        return False, data.get("description", f"Error: {data}")
+        return False, data.get("description", "Unknown error")
     except Exception as e:
         return False, str(e)
 
-def send_tg_message(chat_id, token, text):
-    """Отправляет текстовое сообщение в Telegram"""
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": False
-    }
-    return send_tg_request(token, "sendMessage", payload)
-
 def send_tg_photo(chat_id, token, photo_url, caption=""):
     """Отправляет фото в Telegram по URL"""
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
     payload = {
         "chat_id": chat_id,
         "photo": photo_url,
-        "caption": caption
+        "caption": caption,
+        "parse_mode": "HTML"
     }
-    return send_tg_request(token, "sendPhoto", payload)
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        data = r.json()
+        if data.get("ok"):
+            return True, None
+        return False, data.get("description", "Unknown error")
+    except Exception as e:
+        return False, str(e)
 
 def handle_tg_post(peer_id, text):
     """Обрабатывает TG-пост с защитой от спама"""
-    global TG_PROCESSED
+    global TG_PROCESSED, TG_START_TIME
 
     # Защита 1: проверяем не обрабатывали ли уже
-    post_hash = hash(text.strip()[:300])
+    post_hash = hash(text.strip()[:200])
     if post_hash in TG_PROCESSED:
         log.warning("⚠️ TG-пост уже обрабатывался, пропускаем")
         return None
@@ -410,29 +400,22 @@ def handle_tg_post(peer_id, text):
 
     parsed = parse_tg_post(text)
     if not parsed:
-        return "❌ Неверный формат. Пример:\n\n-1003402995613\n8476739947:AAHP...\nПривет, мяу"
+        return "❌ Неверный формат. Пример:\n-1003402995613\n8476739947:AAHP...\nПривет, мяу"
 
     chat_id = parsed["chat_id"]
     token = parsed["token"]
     message = parsed["message"]
 
-    log.info(f"📤 TG-пост в {chat_id}: {message[:50]}...")
+    log.info(f"📤 TG-пост в {chat_id}: {message[:40]}...")
 
     # Отправляем
     ok, err = send_tg_message(chat_id, token, message)
 
     if ok:
         log.info(f"✅ TG-пост отправлен в {chat_id}")
-        return f"✅ Пост отправлен!\n\n📢 Канал: {chat_id}\n📝 {message[:150]}"
+        return f"✅ Пост отправлен в канал {chat_id}\n\n📝 {message[:100]}"
     else:
         log.error(f"❌ TG ошибка: {err}")
-        # Детальная ошибка
-        if "not found" in str(err).lower():
-            err += "\n\n💡 Проверь:\n1. Бот добавлен в канал\n2. Бот является админом\n3. Chat_id правильный"
-        elif "blocked" in str(err).lower():
-            err += "\n\n💡 Бот заблокирован в канале"
-        elif "rights" in str(err).lower():
-            err += "\n\n💡 У бота нет прав на отправку сообщений"
         return f"❌ Ошибка Telegram:\n{err}"
 
 # ============ ПАУЗА / СТАРТ ============
@@ -507,6 +490,7 @@ def listen_messages(user_id):
                     peer_id = update[3]
                     ts_msg = update[4]  # Временная метка сообщения
                     text = update[5]
+                    text_lower = text.lower().strip()
 
                     # ИСХОДЯЩИЕ — пропускаем (это наши ответы)
                     if flags & 2:
@@ -531,7 +515,29 @@ def listen_messages(user_id):
                         continue
 
                     log.info(f"📩 Запрос: {text[:50]}")
+
+                    # Проверка паузы
+                    global BOT_PAUSED
+                    if BOT_PAUSED:
+                        log.info("⏸ Бот на паузе, игнорируем")
+                        continue
+
+                    # Обработка стоп/старт
+                    pause_result = handle_pause(peer_id, text_lower)
+                    if pause_result:
+                        send_message(peer_id, pause_result)
+                        log.info("✅ Ответ на стоп/старт отправлен")
+                        continue
+
                     send_typing(peer_id)
+
+                    # Проверяем, это TG-пост?
+                    tg_result = handle_tg_post(peer_id, text)
+                    if tg_result:
+                        send_message(peer_id, tg_result)
+                        log.info("✅ TG-пост обработан")
+                        continue
+
                     result = process_command(peer_id, text)
 
                     if result:
