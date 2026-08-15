@@ -5,6 +5,7 @@ import json
 import time
 import random
 import logging
+import threading
 import requests
 from urllib.parse import quote, unquote
 
@@ -12,17 +13,12 @@ from urllib.parse import quote, unquote
 VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
 VK_API_VERSION = "5.199"
 
-# Парсим токен из полной ссылки (Kate Mobile)
-# Формат: https://oauth.vk.com/blank.html#access_token=ТОКЕН&expires_in=0&user_id=123
-if "access_token=" in VK_TOKEN:
+# Парсим токен из полной ссылки
+if VK_TOKEN and "access_token=" in VK_TOKEN:
     match = re.search(r'access_token=([^&\s]+)', VK_TOKEN)
     if match:
         VK_TOKEN = match.group(1)
         print(f"[+] Токен извлечён из ссылки")
-
-if not VK_TOKEN:
-    print("[!] Укажи VK_TOKEN в переменных окружения!")
-    sys.exit(1)
 
 # ============ ЛОГИ ============
 logging.basicConfig(
@@ -68,7 +64,6 @@ def send_typing(peer_id):
 # ============ ПОЛУЧЕНИЕ USER ID ============
 
 def get_user_id():
-    """Определяет ID владельца токена через API"""
     resp = vk_api("users.get", {})
     if resp and "response" in resp and len(resp["response"]) > 0:
         user_id = resp["response"][0]["id"]
@@ -79,44 +74,36 @@ def get_user_id():
     log.error("[!] Не удалось определить ID. Проверь токен!")
     return None
 
-# ============ ПОИСК В ИНТЕРНЕТЕ ============
+# ============ ПОИСК ============
 
 def search_duckduckgo(query):
-    """Поиск через DuckDuckGo HTML версию"""
     try:
         url = "https://html.duckduckgo.com/html/"
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             "Accept": "text/html",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
+            "Accept-Language": "ru-RU,ru;q=0.9"
         }
         r = requests.post(url, data={"q": query, "kl": "ru-ru"}, headers=headers, timeout=20)
-
         results = []
         snippets = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', r.text)
         snippets += re.findall(r'<a class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', r.text)
-
         for link, title in snippets[:5]:
             if "duckduckgo.com/l/?uddg=" in link:
                 link = unquote(link.split("uddg=")[-1])
             title_clean = re.sub(r'<[^>]+>', '', title)
             results.append(f"📌 {title_clean}\n🔗 {link}")
-
         return "\n\n".join(results) if results else "❌ Ничего не нашёл"
     except Exception as e:
-        return f"❌ Ошибка поиска: {e}"
+        return f"❌ Ошибка: {e}"
 
 def search_wikipedia(query):
-    """Поиск в Википедии"""
     try:
         url = f"https://ru.wikipedia.org/api/rest_v1/page/summary/{quote(query.replace(' ', '_'))}"
         r = requests.get(url, timeout=15)
         if r.status_code == 200:
             data = r.json()
-            title = data.get("title", query)
-            extract = data.get("extract", "Нет описания")
-            page_url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
-            return f"📖 *{title}*\n\n{extract}\n\n🔗 {page_url}"
+            return f"📖 *{data.get('title', query)}*\n\n{data.get('extract', 'Нет описания')}\n\n🔗 {data.get('content_urls', {}).get('desktop', {}).get('page', '')}"
         return search_duckduckgo(f"википедия {query}")
     except Exception as e:
         return f"❌ Ошибка: {e}"
@@ -124,21 +111,12 @@ def search_wikipedia(query):
 # ============ КОТИКИ / ПЕСИКИ ============
 
 def get_cat_image():
-    apis = [
-        "https://api.thecatapi.com/v1/images/search",
-        "https://api.cataas.com/cat?json=true",
-    ]
-    for api in apis:
-        try:
-            r = requests.get(api, timeout=10)
-            data = r.json()
-            if isinstance(data, list) and "url" in data[0]:
-                return data[0]["url"]
-            if "url" in data:
-                return data["url"]
-        except:
-            continue
-    return None
+    try:
+        r = requests.get("https://api.thecatapi.com/v1/images/search", timeout=10)
+        data = r.json()
+        return data[0]["url"] if data else None
+    except:
+        return None
 
 def get_dog_image():
     try:
@@ -147,19 +125,15 @@ def get_dog_image():
     except:
         return None
 
-# ============ ПОГОДА ============
+# ============ ПОГОДА / ВАЛЮТА / ШУТКИ / НОВОСТИ / ФАКТ / ПЕРЕВОД / IP ============
 
 def get_weather(city):
     try:
         url = f"https://wttr.in/{quote(city)}?format=3&lang=ru"
         r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            return f"🌤 Погода в {city}:\n{r.text.strip()}"
-        return "❌ Город не найден"
+        return f"🌤 Погода в {city}:\n{r.text.strip()}" if r.status_code == 200 else "❌ Город не найден"
     except Exception as e:
         return f"❌ Ошибка: {e}"
-
-# ============ КУРС ВАЛЮТ ============
 
 def get_currency():
     try:
@@ -167,13 +141,9 @@ def get_currency():
         data = r.json()
         usd = data["Valute"]["USD"]
         eur = data["Valute"]["EUR"]
-        return (f"💰 Курсы ЦБ РФ:\n"
-                f"🇺🇸 USD: {usd['Value']:.2f} ₽\n"
-                f"🇪🇺 EUR: {eur['Value']:.2f} ₽")
+        return f"💰 Курсы ЦБ РФ:\n🇺🇸 USD: {usd['Value']:.2f} ₽\n🇪🇺 EUR: {eur['Value']:.2f} ₽"
     except Exception as e:
         return f"❌ Ошибка: {e}"
-
-# ============ ШУТКИ ============
 
 def get_joke():
     try:
@@ -182,7 +152,6 @@ def get_joke():
             return f"😂 {r.text.strip()}"
     except:
         pass
-
     jokes = [
         "Почему программисты путают Хэллоуин и Рождество? Потому что 31 OCT = 25 DEC",
         "— Доктор, я себя чувствую как JSON... — Ну расскажите... — Я не могу, у меня нет schema.",
@@ -191,63 +160,37 @@ def get_joke():
     ]
     return f"😂 {random.choice(jokes)}"
 
-# ============ НОВОСТИ ============
-
 def get_news():
     try:
         r = requests.get("https://meduza.io/rss/all", timeout=15)
         items = re.findall(r'<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>.*?</item>', r.text, re.DOTALL)
         results = []
         for title, link in items[:5]:
-            title_clean = re.sub(r'<[^>]+>', '', title)
-            results.append(f"📰 {title_clean}\n🔗 {link}")
+            results.append(f"📰 {re.sub(r'<[^>]+>', '', title)}\n🔗 {link}")
         return "\n\n".join(results)
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
-# ============ ФАКТ ============
-
 def get_fact():
     try:
         r = requests.get("https://uselessfacts.jsph.pl/random.json?language=ru", timeout=10)
-        data = r.json()
-        return f"🧠 {data.get('text', 'Факт не найден')}"
+        return f"🧠 {r.json().get('text', 'Факт не найден')}"
     except:
-        facts = [
-            "Медузы не имеют мозга, сердца и костей.",
-            "Осьминоги имеют три сердца.",
-            "Бананы — это ягоды, а клубника — нет.",
-            "В Австралии больше верблюдов, чем в Египте.",
-        ]
+        facts = ["Медузы не имеют мозга, сердца и костей.", "Осьминоги имеют три сердца.", "Бананы — это ягоды, а клубника — нет."]
         return f"🧠 {random.choice(facts)}"
-
-# ============ ПЕРЕВОД ============
 
 def translate_text(text, target_lang="en"):
     try:
-        url = "https://libretranslate.de/translate"
-        payload = {
-            "q": text,
-            "source": "auto",
-            "target": target_lang,
-            "format": "text"
-        }
-        r = requests.post(url, data=payload, timeout=15)
-        data = r.json()
-        return f"🔄 Перевод:\n{text}\n\n➡️ {data.get('translatedText', 'Ошибка')}"
+        r = requests.post("https://libretranslate.de/translate", data={"q": text, "source": "auto", "target": target_lang, "format": "text"}, timeout=15)
+        return f"🔄 Перевод:\n{text}\n\n➡️ {r.json().get('translatedText', 'Ошибка')}"
     except Exception as e:
-        return f"❌ Ошибка перевода: {e}"
-
-# ============ IP / ИНФО ============
+        return f"❌ Ошибка: {e}"
 
 def get_ip_info():
     try:
         r = requests.get("https://ipinfo.io/json", timeout=10)
         data = r.json()
-        return (f"🌐 IP: {data.get('ip', 'N/A')}\n"
-                f"📍 Город: {data.get('city', 'N/A')}\n"
-                f"🏳️ Страна: {data.get('country', 'N/A')}\n"
-                f"🏢 Провайдер: {data.get('org', 'N/A')}")
+        return f"🌐 IP: {data.get('ip', 'N/A')}\n📍 Город: {data.get('city', 'N/A')}\n🏳️ Страна: {data.get('country', 'N/A')}\n🏢 Провайдер: {data.get('org', 'N/A')}"
     except Exception as e:
         return f"❌ Ошибка: {e}"
 
@@ -259,20 +202,16 @@ def upload_and_send_photo(peer_id, photo_url, caption=""):
         if not upload_server:
             return False
         upload_url = upload_server["response"]["upload_url"]
-
         img_data = requests.get(photo_url, timeout=20).content
         files = {"photo": ("image.jpg", img_data)}
         upload_resp = requests.post(upload_url, files=files, timeout=30).json()
-
         saved = vk_api("photos.saveMessagesPhoto", {
             "photo": upload_resp["photo"],
             "server": upload_resp["server"],
             "hash": upload_resp["hash"]
         })
-
         if not saved or "response" not in saved:
             return False
-
         photo = saved["response"][0]
         attachment = f"photo{photo['owner_id']}_{photo['id']}"
         send_message(peer_id, caption, attachment)
@@ -303,15 +242,11 @@ def process_command(peer_id, text):
 
     if text_lower.startswith("поиск ") or text_lower.startswith("search "):
         query = text[7:].strip()
-        if query:
-            return f"🔍 Ищу: *{query}*...\n\n{search_duckduckgo(query)}"
-        return "❌ Укажи запрос для поиска"
+        return f"🔍 Ищу: *{query}*...\n\n{search_duckduckgo(query)}" if query else "❌ Укажи запрос"
 
     if text_lower.startswith("вики ") or text_lower.startswith("wiki "):
         query = text[5:].strip()
-        if query:
-            return search_wikipedia(query)
-        return "❌ Укажи запрос"
+        return search_wikipedia(query) if query else "❌ Укажи запрос"
 
     if text_lower in ["котик", "кот", "кошка", "cat", "киса"]:
         cat_url = get_cat_image()
@@ -329,9 +264,7 @@ def process_command(peer_id, text):
 
     if text_lower.startswith("погода "):
         city = text[7:].strip()
-        if city:
-            return get_weather(city)
-        return "❌ Укажи город"
+        return get_weather(city) if city else "❌ Укажи город"
 
     if text_lower in ["курс", "валюта", "usd", "eur", "доллар", "евро"]:
         return get_currency()
@@ -347,9 +280,7 @@ def process_command(peer_id, text):
 
     if text_lower.startswith("перевод ") or text_lower.startswith("translate "):
         to_translate = text[8:].strip()
-        if to_translate:
-            return translate_text(to_translate)
-        return "❌ Укажи текст для перевода"
+        return translate_text(to_translate) if to_translate else "❌ Укажи текст"
 
     if text_lower in ["ip", "айпи", "мой ip", "интернет"]:
         return get_ip_info()
@@ -414,7 +345,6 @@ def listen_messages(user_id):
 
                     log.info(f"📩 Запрос: {text[:50]}")
                     send_typing(peer_id)
-
                     result = process_command(peer_id, text)
 
                     if result:
@@ -427,15 +357,304 @@ def listen_messages(user_id):
             log.error(f"Ошибка в цикле: {e}")
             time.sleep(5)
 
+# ============ ВЕБ-СЕРВЕР ДЛЯ ВВОДА ТОКЕНА ============
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
+
+CONFIG_FILE = "/tmp/vk_config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VK Browser Bot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0f0f23;
+            color: #fff;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: #1a1a2e;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle {
+            color: #888;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #aaa;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 14px 16px;
+            background: #0f0f23;
+            border: 2px solid #333;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 14px;
+            font-family: monospace;
+            transition: border-color 0.3s;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .hint {
+            color: #666;
+            font-size: 12px;
+            margin-top: 6px;
+            margin-bottom: 20px;
+        }
+        button {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border: none;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102,126,234,0.4);
+        }
+        .status {
+            margin-top: 20px;
+            padding: 14px;
+            border-radius: 10px;
+            font-size: 14px;
+            display: none;
+        }
+        .status.ok { background: rgba(34,197,94,0.15); color: #22c55e; display: block; }
+        .status.err { background: rgba(239,68,68,0.15); color: #ef4444; display: block; }
+        .steps {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #333;
+        }
+        .steps h3 {
+            font-size: 14px;
+            color: #888;
+            margin-bottom: 12px;
+        }
+        .steps ol {
+            padding-left: 18px;
+            color: #aaa;
+            font-size: 13px;
+            line-height: 1.8;
+        }
+        .steps li { margin-bottom: 4px; }
+        .token-example {
+            background: #0f0f23;
+            padding: 10px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 11px;
+            color: #667eea;
+            word-break: break-all;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔥 VK Browser Bot</h1>
+        <p class="subtitle">Безлимитный интернет через ВК</p>
+
+        <form id="tokenForm">
+            <label>Kate Mobile Token</label>
+            <input type="text" id="token" placeholder="vk1.a.xxx... или полная ссылка" required>
+            <p class="hint">Можно вставить полную ссылку из Kate Mobile</p>
+
+            <button type="submit">🚀 Запустить бота</button>
+        </form>
+
+        <div id="status" class="status"></div>
+
+        <div class="steps">
+            <h3>📱 Как получить токен:</h3>
+            <ol>
+                <li>Открой Kate Mobile</li>
+                <li>Настройки → Другое → Копировать ссылку для токена</li>
+                <li>Вставь сюда полную ссылку</li>
+            </ol>
+            <div class="token-example">https://oauth.vk.com/blank.html#access_token=vk1.a.xxx...&expires_in=0&user_id=123</div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('tokenForm').onsubmit = async function(e) {
+            e.preventDefault();
+            const token = document.getElementById('token').value.trim();
+            const status = document.getElementById('status');
+
+            status.className = 'status';
+            status.style.display = 'block';
+            status.textContent = '⏳ Проверяю токен...';
+
+            try {
+                const resp = await fetch('/save', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token: token})
+                });
+                const data = await resp.json();
+
+                if (data.ok) {
+                    status.className = 'status ok';
+                    status.innerHTML = '✅ Бот запущен!<br>👤 ' + data.name + ' (ID: ' + data.user_id + ')<br>💬 Напиши "помощь" в чат с самим собой в ВК';
+                } else {
+                    status.className = 'status err';
+                    status.textContent = '❌ ' + data.error;
+                }
+            } catch(err) {
+                status.className = 'status err';
+                status.textContent = '❌ Ошибка: ' + err.message;
+            }
+        };
+    </script>
+</body>
+</html>
+"""
+
+class WebHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode("utf-8"))
+        elif self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        global VK_TOKEN
+        if self.path == "/save":
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len).decode('utf-8')
+            data = json.loads(body)
+            token = data.get("token", "").strip()
+
+            # Парсим из ссылки
+            if "access_token=" in token:
+                match = re.search(r'access_token=([^&\s]+)', token)
+                if match:
+                    token = match.group(1)
+
+            # Проверяем токен
+            test_url = f"https://api.vk.com/method/users.get?access_token={token}&v=5.199"
+            try:
+                r = requests.get(test_url, timeout=10)
+                vk_data = r.json()
+
+                if "error" in vk_data:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": False, "error": vk_data["error"]["error_msg"]}).encode())
+                    return
+
+                user = vk_data["response"][0]
+                user_id = user["id"]
+                name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
+
+                # Сохраняем
+                VK_TOKEN = token
+                save_config({"token": token, "user_id": user_id})
+
+                # Запускаем бота в фоне
+                def start_bot():
+                    listen_messages(user_id)
+                bot_thread = threading.Thread(target=start_bot, daemon=True)
+                bot_thread.start()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "user_id": user_id, "name": name}).encode())
+
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_web_server():
+    port = int(os.environ.get("PORT", "8080"))
+    with socketserver.TCPServer(("", port), WebHandler) as httpd:
+        log.info(f"🌐 Веб-интерфейс: http://localhost:{port}")
+        httpd.serve_forever()
+
 # ============ ЗАПУСК ============
 
 if __name__ == "__main__":
-    log.info("🚀 Запуск VK Browser Bot...")
-    log.info("[Kate Mobile Token Mode]")
+    log.info("🚀 VK Browser Bot запускается...")
 
-    # Автоопределение ID
-    USER_ID = get_user_id()
-    if not USER_ID:
-        sys.exit(1)
+    # Проверяем сохранённый конфиг
+    cfg = load_config()
+    if cfg.get("token"):
+        VK_TOKEN = cfg["token"]
+        log.info("[+] Токен загружен из конфига")
 
-    listen_messages(USER_ID)
+        # Проверяем и запускаем
+        user_id = get_user_id()
+        if user_id:
+            def start_bot():
+                listen_messages(user_id)
+            bot_thread = threading.Thread(target=start_bot, daemon=True)
+            bot_thread.start()
+
+    # Запускаем веб-сервер (основной поток)
+    start_web_server()
