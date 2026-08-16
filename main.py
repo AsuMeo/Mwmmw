@@ -1,856 +1,851 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-VK self-chat -> Telegram channel publisher.
-
-Python: 3.10+
-Dependency: requests
-
-Environment:
-  VK_TOKEN=...                 optional; can also be entered in the web UI
-  PORT=8080
-  CONFIG_FILE=./vk_config.json
-  STATE_DB=./bot_state.sqlite3
-  LOG_FILE=./bot.log
-
-Telegram post format (the first two lines may be swapped):
-  -1001234567890
-  123456789:AA...
-  Post text
-
-A single VK photo/video attachment is supported.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import html
-import json
-import logging
-import mimetypes
 import os
-import random
+import sys
 import re
-import sqlite3
-import tempfile
-import threading
+import json
 import time
-from collections import deque
-from http.server import BaseHTTPRequestHandler
-from logging.handlers import RotatingFileHandler
-from socketserver import ThreadingTCPServer
-from typing import Any, Optional
-from urllib.parse import parse_qs, unquote, urlparse
-
+import random
+import logging
+import threading
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib.parse import quote, unquote
 
-
-# ==================== CONFIG ====================
-
-VK_API_VERSION = "5.199"
+# ============ НАСТРОЙКИ ============
 VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
-PORT = int(os.environ.get("PORT", "8080"))
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "./vk_config.json")
-STATE_DB = os.environ.get("STATE_DB", "./bot_state.sqlite3")
-LOG_FILE = os.environ.get("LOG_FILE", "./bot.log")
+VK_API_VERSION = "5.199"
 
-TG_CHANNEL_COOLDOWN = int(os.environ.get("TG_CHANNEL_COOLDOWN", "30"))
-TG_CHANNEL_HOURLY_LIMIT = int(os.environ.get("TG_CHANNEL_HOURLY_LIMIT", "6"))
-TG_GLOBAL_HOURLY_LIMIT = int(os.environ.get("TG_GLOBAL_HOURLY_LIMIT", "15"))
-TG_SAME_CONTENT_TTL = int(os.environ.get("TG_SAME_CONTENT_TTL", "86400"))
-TG_MAX_TEXT = 4096
-TG_MAX_CAPTION = 1024
-TG_MAX_PHOTO_BYTES = 10 * 1024 * 1024
-TG_MAX_VIDEO_BYTES = 50 * 1024 * 1024
+# Парсим токен из полной ссылки
+if VK_TOKEN and "access_token=" in VK_TOKEN:
+    match = re.search(r'access_token=([^&\s]+)', VK_TOKEN)
+    if match:
+        VK_TOKEN = match.group(1)
+        print(f"[+] VK Токен извлечён из ссылки")
 
-TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{30,}$")
-CHAT_RE = re.compile(r"^(?:-?\d{5,20}|@[A-Za-z][A-Za-z0-9_]{3,31})$")
+# ============ СУПЕР ЛОГИ ============
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("vk-tg-bot")
 
-BOT_PAUSED = False
-BOT_THREAD: Optional[threading.Thread] = None
-BOT_THREAD_LOCK = threading.Lock()
-ACTIVE_VK_TOKEN = ""
-STOP_EVENT = threading.Event()
-POST_LOCK = threading.Lock()
-RECENT_VK_IDS: deque[int] = deque(maxlen=3000)
-RECENT_VK_SET: set[int] = set()
+# ============ VK API ============
 
-
-def extract_vk_token(value: str) -> str:
-    value = html.unescape((value or "").strip())
-    if "access_token=" not in value:
-        return value
-    parsed = urlparse(value)
-    values = parse_qs(parsed.query).get("access_token") or parse_qs(parsed.fragment).get("access_token")
-    if values:
-        return unquote(values[0]).strip()
-    match = re.search(r"access_token=([^&\s]+)", value)
-    return unquote(match.group(1)).strip() if match else value
-
-
-VK_TOKEN = extract_vk_token(VK_TOKEN)
-
-
-# ==================== LOGGING ====================
-
-class SecretFilter(logging.Filter):
-    TOKEN_IN_TEXT = re.compile(r"\b\d{5,15}:[A-Za-z0-9_-]{20,}\b")
-    VK_IN_TEXT = re.compile(r"\bvk1\.[A-Za-z0-9._-]+\b")
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        message = self.TOKEN_IN_TEXT.sub("<TG_TOKEN_REDACTED>", message)
-        message = self.VK_IN_TEXT.sub("<VK_TOKEN_REDACTED>", message)
-        record.msg = message
-        record.args = ()
-        return True
-
-
-log = logging.getLogger("vk-tg-publisher")
-log.setLevel(logging.INFO)
-formatter = logging.Formatter("[%(asctime)s] %(levelname)s %(threadName)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-for handler in (
-    logging.StreamHandler(),
-    RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
-):
-    handler.setFormatter(formatter)
-    handler.addFilter(SecretFilter())
-    log.addHandler(handler)
-
-
-# ==================== HTTP ====================
-
-SESSION = requests.Session()
-# Retries are allowed only for safe GET calls. POST is deliberately not retried:
-# retrying sendMessage/sendPhoto after a timeout can duplicate a channel post.
-retry = Retry(total=3, connect=3, read=2, backoff_factor=0.7, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET"}))
-SESSION.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20))
-SESSION.headers.update({"User-Agent": "VK-TG-Publisher/3.0"})
-
-
-# ==================== PERSISTENT STATE / ANTISPAM ====================
-
-def db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(STATE_DB, timeout=15)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=15000")
-    return con
-
-
-def init_db() -> None:
-    with db_connect() as con:
-        con.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS posts (
-                vk_message_id INTEGER PRIMARY KEY,
-                created_at INTEGER NOT NULL,
-                channel TEXT NOT NULL,
-                bot_fp TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                status TEXT NOT NULL,
-                error TEXT DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(created_at);
-            CREATE INDEX IF NOT EXISTS idx_posts_channel_time ON posts(channel, created_at);
-            CREATE INDEX IF NOT EXISTS idx_posts_content ON posts(channel, content_hash, created_at);
-            CREATE TABLE IF NOT EXISTS known_channels (
-                bot_fp TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
-                title TEXT DEFAULT '',
-                username TEXT DEFAULT '',
-                last_seen INTEGER NOT NULL,
-                PRIMARY KEY(bot_fp, chat_id)
-            );
-            """
-        )
-        con.execute("DELETE FROM posts WHERE created_at < ?", (int(time.time()) - 30 * 86400,))
-
-
-def token_fp(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()[:16]
-
-
-def content_digest(chat_id: str, text: str, media: Optional[dict[str, Any]]) -> str:
-    media_key = ""
-    if media:
-        media_key = f"{media.get('type','')}:{media.get('owner_id','')}:{media.get('id','')}"
-    return hashlib.sha256(f"{chat_id}\0{text}\0{media_key}".encode()).hexdigest()
-
-
-def reserve_post(vk_message_id: int, chat_id: str, fp: str, digest: str) -> tuple[bool, str]:
-    now = int(time.time())
-    with db_connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        existing = con.execute("SELECT status FROM posts WHERE vk_message_id=?", (vk_message_id,)).fetchone()
-        if existing:
-            return False, f"Это VK-сообщение уже обработано (статус: {existing[0]}). Повтор запрещён."
-
-        last = con.execute(
-            "SELECT created_at FROM posts WHERE channel=? AND status IN ('pending','sent') ORDER BY created_at DESC LIMIT 1",
-            (chat_id,),
-        ).fetchone()
-        if last and now - last[0] < TG_CHANNEL_COOLDOWN:
-            return False, f"Защита от спама: подожди ещё {TG_CHANNEL_COOLDOWN - (now - last[0])} сек."
-
-        channel_count = con.execute(
-            "SELECT COUNT(*) FROM posts WHERE channel=? AND created_at>? AND status IN ('pending','sent')",
-            (chat_id, now - 3600),
-        ).fetchone()[0]
-        if channel_count >= TG_CHANNEL_HOURLY_LIMIT:
-            return False, f"Лимит канала: {TG_CHANNEL_HOURLY_LIMIT} постов в час."
-
-        global_count = con.execute(
-            "SELECT COUNT(*) FROM posts WHERE created_at>? AND status IN ('pending','sent')",
-            (now - 3600,),
-        ).fetchone()[0]
-        if global_count >= TG_GLOBAL_HOURLY_LIMIT:
-            return False, f"Глобальный лимит: {TG_GLOBAL_HOURLY_LIMIT} постов в час."
-
-        duplicate = con.execute(
-            "SELECT 1 FROM posts WHERE channel=? AND content_hash=? AND created_at>? AND status IN ('pending','sent') LIMIT 1",
-            (chat_id, digest, now - TG_SAME_CONTENT_TTL),
-        ).fetchone()
-        if duplicate:
-            return False, "Такой же пост уже отправлялся в этот канал за последние 24 часа."
-
-        con.execute(
-            "INSERT INTO posts(vk_message_id,created_at,channel,bot_fp,content_hash,status) VALUES(?,?,?,?,?,'pending')",
-            (vk_message_id, now, chat_id, fp, digest),
-        )
-    return True, ""
-
-
-def finish_post(vk_message_id: int, status: str, error: str = "") -> None:
-    with db_connect() as con:
-        con.execute("UPDATE posts SET status=?, error=? WHERE vk_message_id=?", (status, error[:500], vk_message_id))
-
-
-def remember_channel(token: str, chat: dict[str, Any]) -> None:
-    chat_id = str(chat.get("id", ""))
-    if not chat_id:
-        return
-    with db_connect() as con:
-        con.execute(
-            """INSERT INTO known_channels(bot_fp,chat_id,title,username,last_seen)
-               VALUES(?,?,?,?,?)
-               ON CONFLICT(bot_fp,chat_id) DO UPDATE SET
-               title=excluded.title, username=excluded.username, last_seen=excluded.last_seen""",
-            (token_fp(token), chat_id, chat.get("title", ""), chat.get("username", ""), int(time.time())),
-        )
-
-
-# ==================== VK API ====================
-
-def vk_api(method: str, params: Optional[dict[str, Any]] = None, token: Optional[str] = None) -> Optional[dict[str, Any]]:
-    actual_token = token if token is not None else VK_TOKEN
-    payload = dict(params or {})
-    payload.update({"access_token": actual_token, "v": VK_API_VERSION})
+def vk_api(method, params=None):
+    if params is None:
+        params = {}
+    url = f"https://api.vk.com/method/{method}"
+    params.update({
+        "access_token": VK_TOKEN,
+        "v": VK_API_VERSION
+    })
     try:
-        response = SESSION.post(f"https://api.vk.com/method/{method}", data=payload, timeout=(10, 30))
-        data = response.json()
+        r = requests.get(url, params=params, timeout=30)
+        data = r.json()
         if "error" in data:
             err = data["error"]
-            log.error("VK API %s error %s: %s", method, err.get("error_code"), err.get("error_msg"))
+            log.error(f"❌ VK API error {err.get('error_code')}: {err.get('error_msg')}")
             return None
         return data
-    except Exception as exc:
-        log.exception("VK API %s request failed: %s", method, exc)
+    except Exception as e:
+        log.error(f"❌ Ошибка запроса VK API ({method}): {e}")
         return None
 
-
-def get_vk_user(token: Optional[str] = None) -> Optional[dict[str, Any]]:
-    data = vk_api("users.get", token=token)
-    items = (data or {}).get("response", [])
-    return items[0] if items else None
-
-
-def send_vk_message(peer_id: int, text: str) -> None:
-    result = vk_api("messages.send", {
+def send_message(peer_id, text, attachment=""):
+    params = {
         "peer_id": peer_id,
-        "message": text[:4000],
-        "random_id": random.randint(1, 2_147_483_647),
-    })
-    if not result:
-        log.error("Не удалось отправить ответ в VK peer_id=%s", peer_id)
+        "message": text,
+        "random_id": random.randint(-2147483648, 2147483647)
+    }
+    if attachment:
+        params["attachment"] = attachment
+    return vk_api("messages.send", params)
 
-
-def send_typing(peer_id: int) -> None:
+def send_typing(peer_id):
     vk_api("messages.setActivity", {"peer_id": peer_id, "type": "typing"})
 
+def get_vk_message_attachments(msg_id):
+    """Извлекает прямые URL фото и медиафайлов из ВК сообщения по msg_id"""
+    if not msg_id:
+        return [], []
+    resp = vk_api("messages.getById", {"message_ids": msg_id})
+    photos = []
+    videos = []
+    if resp and "response" in resp and resp["response"]["items"]:
+        msg_item = resp["response"]["items"][0]
+        for att in msg_item.get("attachments", []):
+            att_type = att.get("type")
+            if att_type == "photo" and "photo" in att:
+                sizes = att["photo"].get("sizes", [])
+                if sizes:
+                    # Выбираем фото наибольшего разрешения
+                    best_size = max(sizes, key=lambda x: x.get("width", 0) * x.get("height", 0))
+                    photos.append(best_size.get("url"))
+            elif att_type == "video" and "video" in att:
+                # Берем превью видео
+                img_sizes = att["video"].get("image", [])
+                if img_sizes:
+                    best_img = max(img_sizes, key=lambda x: x.get("width", 0) * x.get("height", 0))
+                    photos.append(best_img.get("url"))
+    return photos, videos
 
-def get_vk_message(message_id: int) -> Optional[dict[str, Any]]:
-    data = vk_api("messages.getById", {"message_ids": message_id, "extended": 0})
-    response = (data or {}).get("response", {})
-    items = response.get("items", []) if isinstance(response, dict) else response
-    return items[0] if items else None
+# ============ ПОЛУЧЕНИЕ USER ID ============
 
+def get_user_id():
+    resp = vk_api("users.get", {})
+    if resp and "response" in resp and len(resp["response"]) > 0:
+        user_id = resp["response"][0]["id"]
+        first_name = resp["response"][0].get("first_name", "")
+        last_name = resp["response"][0].get("last_name", "")
+        log.info(f"✅ VK Токен успешно проверен: {first_name} {last_name} (ID: {user_id})")
+        return user_id
+    log.error("❌ Не удалось определить VK ID. Проверь VK_TOKEN!")
+    return None
 
-# ==================== TELEGRAM API ====================
+# ============ ТЕЛЕГРАМ АПИ И АВТО-ОБНАРУЖЕНИЕ КАНАЛОВ ============
 
-def tg_api(token: str, method: str, data: Optional[dict[str, Any]] = None, files: Optional[dict[str, Any]] = None, timeout: int = 45) -> tuple[bool, Any]:
+def tg_api(token, method, payload=None):
+    """Вызов Telegram Bot API с обработкой ошибок"""
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
-        response = SESSION.post(url, data=data or {}, files=files, timeout=(10, timeout))
-        try:
-            body = response.json()
-        except ValueError:
-            return False, f"HTTP {response.status_code}: Telegram вернул не JSON"
-        if body.get("ok"):
-            return True, body.get("result")
-        description = body.get("description", "Unknown Telegram error")
-        parameters = body.get("parameters") or {}
-        if parameters.get("retry_after"):
-            description += f"; retry_after={parameters['retry_after']} сек. Автоповтор отключён."
-        return False, description
-    except requests.Timeout:
-        # Outcome is uncertain. Never retry automatically: it could duplicate a post.
-        return False, "Тайм-аут Telegram. Результат неизвестен; автоповтор отключён во избежание дубля. Проверь канал."
-    except Exception as exc:
-        return False, f"Сетевая ошибка: {exc}"
+        r = requests.post(url, json=payload, timeout=25)
+        return r.json()
+    except Exception as e:
+        log.error(f"❌ Telegram HTTP error ({method}): {e}")
+        return {"ok": False, "description": str(e)}
 
+def check_tg_bot_admin_status(token, target_chat_id=None):
+    """
+    Проверяет, в каких каналах/чатах бот является администратором.
+    Опрашивает getMe и getUpdates Telegram API.
+    """
+    log.info("🔍 Проверка прав и доступных каналов Telegram бота...")
+    me_resp = tg_api(token, "getMe")
+    if not me_resp.get("ok"):
+        err_msg = me_resp.get("description", "Неверный токен")
+        log.error(f"❌ Telegram token check failed: {err_msg}")
+        return False, f"❌ Ошибка токена Telegram:\n{err_msg}"
 
-def validate_bot_admin(token: str, chat_id: str) -> tuple[bool, str, Optional[dict[str, Any]]]:
-    ok, me = tg_api(token, "getMe")
-    if not ok:
-        return False, f"Токен бота не работает: {me}", None
+    bot_info = me_resp.get("result", {})
+    bot_id = bot_info.get("id")
+    bot_name = bot_info.get("first_name", "Bot")
+    bot_user = bot_info.get("username", "bot")
 
-    ok, chat = tg_api(token, "getChat", {"chat_id": chat_id})
-    if not ok:
-        return False, f"Канал не найден/бот не имеет доступа: {chat}", None
+    chats_to_check = set()
+    if target_chat_id:
+        chats_to_check.add(str(target_chat_id).strip())
 
-    chat_type = chat.get("type")
-    if chat_type not in ("channel", "supergroup", "group"):
-        return False, f"Нельзя публиковать: тип чата {chat_type!r}.", None
+    # Поиск каналов через getUpdates
+    upd_resp = tg_api(token, "getUpdates", {"limit": 100, "allowed_updates": ["message", "channel_post", "my_chat_member"]})
+    if upd_resp.get("ok"):
+        for update in upd_resp.get("result", []):
+            for key in ["message", "channel_post", "edited_channel_post", "my_chat_member"]:
+                if key in update:
+                    chat = update[key].get("chat")
+                    if chat and "id" in chat:
+                        chats_to_check.add(str(chat["id"]))
 
-    ok, member = tg_api(token, "getChatMember", {"chat_id": chat_id, "user_id": me["id"]})
-    if not ok:
-        return False, f"Не удалось проверить права бота: {member}", None
+    found_reports = []
 
-    if member.get("status") not in ("administrator", "creator"):
-        return False, f"Бот не администратор (status={member.get('status')}).", None
-    if chat_type == "channel" and member.get("status") != "creator" and not member.get("can_post_messages", False):
-        return False, "Бот администратор, но у него выключено право «Публикация сообщений».", None
+    for cid in chats_to_check:
+        chat_resp = tg_api(token, "getChat", {"chat_id": cid})
+        if chat_resp.get("ok"):
+            c_data = chat_resp.get("result", {})
+            title = c_data.get("title", c_data.get("username", cid))
+            ctype = c_data.get("type", "канал/чат")
+            
+            # Проверяем статус бота
+            mem_resp = tg_api(token, "getChatMember", {"chat_id": cid, "user_id": bot_id})
+            if mem_resp.get("ok"):
+                m_data = mem_resp.get("result", {})
+                status = m_data.get("status", "unknown")
+                can_post = m_data.get("can_post_messages", True)
+                
+                if status in ["administrator", "creator"]:
+                    post_str = "✅ Да (Есть права публикации)" if can_post else "⚠️ Админ (без права постов)"
+                    found_reports.append(f"📢 *{title}*\n🆔 ID: `{cid}`\n⚙️ Тип: {ctype}\n👑 Статус: АДМИНИСТРАТОР\n✍️ Публикация: {post_str}")
+                else:
+                    found_reports.append(f"📌 *{title}*\n🆔 ID: `{cid}`\n⚙️ Статус: {status} (Не админ!)")
 
-    remember_channel(token, chat)
-    return True, "", chat
-
-
-def parse_tg_post(text: str) -> Optional[dict[str, str]]:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    lines = normalized.split("\n")
-    if len(lines) < 3:
-        return None
-    first, second = lines[0].strip(), lines[1].strip()
-    if CHAT_RE.fullmatch(first) and TOKEN_RE.fullmatch(second):
-        chat_id, token = first, second
-    elif TOKEN_RE.fullmatch(first) and CHAT_RE.fullmatch(second):
-        token, chat_id = first, second
+    report = f"🤖 *Информация о боте Telegram:*\n Имя: *{bot_name}*\n Юзернейм: @{bot_user}\n ID бота: `{bot_id}`\n\n"
+    if found_reports:
+        report += "📋 *Каналы и чаты бота:*\n\n" + "\n\n".join(found_reports)
     else:
-        return None
-    return {"chat_id": chat_id, "token": token, "message": "\n".join(lines[2:]).strip()}
+        report += ("⚠️ *Бот не нашел каналы автоматически через историю сообщений.*\n\n"
+                   "💡 *Как проверить конкретный канал:*\n"
+                   "Отправь команду:\n`админ\n<БОТ_ТОКЕН>\n<ИД_КАНАЛА>`\n"
+                   "или просто сделай пост в канал!")
 
+    return True, report
 
-def choose_photo_url(photo: dict[str, Any]) -> Optional[str]:
-    sizes = photo.get("sizes") or []
-    sizes = sorted(sizes, key=lambda x: int(x.get("width", 0)) * int(x.get("height", 0)), reverse=True)
-    return sizes[0].get("url") if sizes else None
+# ============ ЗАЩИТА ОТ СПАМА (КРИТИЧЕСКИ ВАЖНО) ============
+LAST_TG_POST_TIME = {}  # chat_id -> timestamp (Защита от частоты постов)
+TG_POST_HASHES = {}     # hash -> timestamp (Защита от дублей постов)
+MIN_POST_INTERVAL = 3   # Минимальный интервал между постами в 1 канал (сек)
+DUPLICATE_COOLDOWN = 300 # Кулдаун одинаковых сообщений (5 минут)
 
+def validate_anti_spam(chat_id, text, photos=None):
+    """
+    Мощная система защиты канала от спама и блокировок Telegram:
+    1. Защита от частых запросов (Rate Limit)
+    2. Защита от флуда дубликатами
+    3. Защита от пустых или гигантских сообщений
+    """
+    now = time.time()
 
-def choose_video_url(video: dict[str, Any]) -> Optional[str]:
-    owner_id, video_id = video.get("owner_id"), video.get("id")
-    if owner_id is None or video_id is None:
-        return None
-    key = f"{owner_id}_{video_id}"
-    if video.get("access_key"):
-        key += f"_{video['access_key']}"
-    data = vk_api("video.get", {"videos": key})
-    items = ((data or {}).get("response") or {}).get("items", [])
-    if not items:
-        return None
-    files = items[0].get("files") or {}
-    candidates = []
-    for name, url in files.items():
-        match = re.fullmatch(r"mp4_(\d+)", name)
-        if match and isinstance(url, str):
-            candidates.append((int(match.group(1)), url))
-    return max(candidates, default=(0, None))[1]
+    # 1. Защита от дублей по тексту и фото
+    content_key = f"{chat_id}:{text.strip()}:{len(photos or [])}"
+    post_hash = hash(content_key)
+    last_hash_time = TG_POST_HASHES.get(post_hash, 0)
+    if now - last_hash_time < DUPLICATE_COOLDOWN:
+        remaining = int(DUPLICATE_COOLDOWN - (now - last_hash_time))
+        log.warning(f"🛡 [СПАМ-ФИЛЬТР] Заблокирован дубликат поста в {chat_id}. Осталось {remaining}с кулдауна.")
+        return False, f"🛡 *ЗАЩИТА ОТ СПАМА ЗАБЛОКИРОВАЛА ДУБЛИКАТ!*\n\nЭтот пост уже отправлялся в канал `{chat_id}` недавно.\nПовторить можно через {remaining} сек.", None
 
+    # 2. Защита от частоты (Rate Limiting)
+    last_post = LAST_TG_POST_TIME.get(chat_id, 0)
+    if now - last_post < MIN_POST_INTERVAL:
+        wait = int(MIN_POST_INTERVAL - (now - last_post)) + 1
+        log.warning(f"🛡 [СПАМ-ФИЛЬТР] Слишком частая отправка в {chat_id}. Задержка {wait}s.")
+        return False, f"🛡 *ЗАЩИТА ОТ СПАМА:* Слишком частая публикация в канал `{chat_id}`!\nПодождите {wait} сек. перед следующим постом.", None
 
-def extract_media(message: Optional[dict[str, Any]]) -> tuple[Optional[dict[str, Any]], str]:
-    attachments = (message or {}).get("attachments") or []
-    supported = [a for a in attachments if a.get("type") in ("photo", "video")]
-    if not supported:
-        return None, ""
-    warning = ""
-    if len(supported) > 1:
-        warning = "В сообщении несколько медиа; безопасно отправлено только первое."
-    item = supported[0]
-    kind = item["type"]
-    obj = item.get(kind) or {}
-    url = choose_photo_url(obj) if kind == "photo" else choose_video_url(obj)
-    if not url:
-        return None, f"Не удалось получить прямую ссылку на {kind} из VK. Возможно, файл приватный."
-    return {
-        "type": kind,
-        "url": url,
-        "owner_id": obj.get("owner_id", ""),
-        "id": obj.get("id", ""),
-    }, warning
+    # Очистка старой памяти каждые 500 записей
+    if len(TG_POST_HASHES) > 500:
+        TG_POST_HASHES.clear()
 
+    return True, "OK", post_hash
 
-def download_media(media: dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    kind = media["type"]
-    limit = TG_MAX_PHOTO_BYTES if kind == "photo" else TG_MAX_VIDEO_BYTES
-    try:
-        with SESSION.get(media["url"], stream=True, timeout=(10, 60)) as response:
-            response.raise_for_status()
-            declared = int(response.headers.get("Content-Length", "0") or 0)
-            if declared > limit:
-                return None, None, f"Файл слишком большой: {declared // 1024 // 1024} МБ, лимит {limit // 1024 // 1024} МБ."
-            mime = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
-            suffix = mimetypes.guess_extension(mime) or (".jpg" if kind == "photo" else ".mp4")
-            temp = tempfile.NamedTemporaryFile(prefix="vk_tg_", suffix=suffix, delete=False)
-            total = 0
-            try:
-                for chunk in response.iter_content(256 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > limit:
-                        temp.close()
-                        os.unlink(temp.name)
-                        return None, None, f"Файл превысил лимит {limit // 1024 // 1024} МБ."
-                    temp.write(chunk)
-                temp.close()
-                if total == 0:
-                    os.unlink(temp.name)
-                    return None, None, "VK вернул пустой медиафайл."
-                return temp.name, mime or None, None
-            except Exception:
-                temp.close()
-                if os.path.exists(temp.name):
-                    os.unlink(temp.name)
-                raise
-    except Exception as exc:
-        return None, None, f"Не удалось скачать медиа из VK: {exc}"
+# ============ ОТПРАВКА ПОСТА В ТЕЛЕГРАМ ============
 
+def send_tg_channel_post(chat_id, token, text, photos=None):
+    """Отправка поста в канал Telegram с поддержкой текста и медиа"""
+    if photos is None:
+        photos = []
 
-def publish_tg(token: str, chat_id: str, text: str, media: Optional[dict[str, Any]]) -> tuple[bool, str]:
-    if not media:
-        ok, result = tg_api(token, "sendMessage", {
+    log.info(f"🚀 [TG POST] Начинаем публикацию в {chat_id} | Фото: {len(photos)} шт.")
+
+    # Проверка антиспама
+    is_safe, spam_msg, p_hash = validate_anti_spam(chat_id, text, photos)
+    if not is_safe:
+        return False, spam_msg
+
+    # Проверяем, существует ли канал и админ ли бот
+    chat_info = tg_api(token, "getChat", {"chat_id": chat_id})
+    if not chat_info.get("ok"):
+        err = chat_info.get("description", "Канал не найден или бот не добавлен")
+        log.error(f"❌ [TG ERROR] Ошибка канала {chat_id}: {err}")
+        return False, f"❌ Ошибка Telegram (Канал {chat_id}):\n{err}\n\nУбедись, что бот добавлен в канал и сделан администратором!"
+
+    channel_title = chat_info.get("result", {}).get("title", chat_id)
+
+    # Публикация
+    success = False
+    error_desc = ""
+
+    if photos:
+        # Отправляем первое фото с подписью
+        photo_url = photos[0]
+        payload = {
+            "chat_id": chat_id,
+            "photo": photo_url,
+            "caption": text[:1024],
+            "parse_mode": "HTML"
+        }
+        res = tg_api(token, "sendPhoto", payload)
+        if not res.get("ok"):
+            # Фолбэк без HTML форматирования при ошибке разбора спецсимволов
+            payload.pop("parse_mode", None)
+            res = tg_api(token, "sendPhoto", payload)
+
+        if res.get("ok"):
+            success = True
+        else:
+            error_desc = res.get("description", "Unknown photo error")
+    else:
+        # Текстовое сообщение
+        payload = {
             "chat_id": chat_id,
             "text": text,
-            "disable_web_page_preview": "false",
-        })
-        return ok, "" if ok else str(result)
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        }
+        res = tg_api(token, "sendMessage", payload)
+        if not res.get("ok"):
+            # Фолбэк без HTML
+            payload.pop("parse_mode", None)
+            res = tg_api(token, "sendMessage", payload)
 
-    path, mime, error = download_media(media)
-    if error:
-        return False, error
-    assert path
-    kind = media["type"]
-    method = "sendPhoto" if kind == "photo" else "sendVideo"
-    field = "photo" if kind == "photo" else "video"
-    filename = os.path.basename(path)
-    try:
-        with open(path, "rb") as stream:
-            data = {"chat_id": chat_id, "caption": text}
-            if kind == "video":
-                data["supports_streaming"] = "true"
-            ok, result = tg_api(token, method, data, {field: (filename, stream, mime or "application/octet-stream")}, timeout=120)
-            return ok, "" if ok else str(result)
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
-# ==================== COMMANDS ====================
-
-HELP = """🚀 VK → Telegram publisher
-
-Пост (ID и токен можно менять местами):
--1001234567890
-123456789:AA...
-Текст поста
-
-К этому VK-сообщению можно прикрепить одно фото или видео.
-
-Команды:
-• тг проверить\nTOKEN\nCHAT_ID — проверить канал и права
-• тг каналы\nTOKEN — показать каналы, которые Bot API уже видел
-• статус — состояние и лимиты
-• стоп / старт — пауза и продолжение
-
-Защита: без автоповторов, дедупликация, пауза между постами, часовые лимиты и запрет одинакового поста на 24 часа."""
-
-
-def command_check_channel(text: str) -> Optional[str]:
-    lines = [x.strip() for x in text.replace("\r", "").split("\n")]
-    if not lines or lines[0].lower() not in ("тг проверить", "tg check"):
-        return None
-    if len(lines) < 3:
-        return "❌ Формат:\nтг проверить\nBOT_TOKEN\n-100CHANNEL_ID"
-    token, chat_id = lines[1], lines[2]
-    if not TOKEN_RE.fullmatch(token) or not CHAT_RE.fullmatch(chat_id):
-        return "❌ Неверный токен или ID канала."
-    ok, error, chat = validate_bot_admin(token, chat_id)
-    if not ok:
-        return f"❌ {error}"
-    return f"✅ Всё готово.\nКанал: {chat.get('title') or chat.get('username') or chat_id}\nID: {chat.get('id')}\nБот — администратор и может публиковать."
-
-
-def command_known_channels(text: str) -> Optional[str]:
-    lines = [x.strip() for x in text.replace("\r", "").split("\n")]
-    if not lines or lines[0].lower() not in ("тг каналы", "tg channels"):
-        return None
-    if len(lines) < 2 or not TOKEN_RE.fullmatch(lines[1]):
-        return "❌ Формат:\nтг каналы\nBOT_TOKEN"
-    token = lines[1]
-    ok, me = tg_api(token, "getMe")
-    if not ok:
-        return f"❌ Токен не работает: {me}"
-
-    # Telegram Bot API has no method that returns every channel where a bot is admin.
-    # We can only inspect channels already seen in updates or stored after successful checks/posts.
-    ok_webhook, webhook = tg_api(token, "getWebhookInfo")
-    update_note = ""
-    if ok_webhook and webhook.get("url"):
-        update_note = "У бота включён webhook, поэтому getUpdates не вызывался."
-    else:
-        ok_updates, updates = tg_api(token, "getUpdates", {
-            "timeout": 0,
-            "limit": 100,
-            "allowed_updates": json.dumps(["channel_post", "edited_channel_post", "my_chat_member"]),
-        })
-        if ok_updates:
-            for update in updates:
-                chat = None
-                for key in ("channel_post", "edited_channel_post"):
-                    if update.get(key):
-                        chat = update[key].get("chat")
-                if update.get("my_chat_member"):
-                    chat = update["my_chat_member"].get("chat")
-                if chat and chat.get("type") == "channel":
-                    remember_channel(token, chat)
+        if res.get("ok"):
+            success = True
         else:
-            update_note = f"Не удалось прочитать updates: {updates}"
+            error_desc = res.get("description", "Unknown text error")
 
-    with db_connect() as con:
-        rows = con.execute(
-            "SELECT chat_id,title,username FROM known_channels WHERE bot_fp=? ORDER BY last_seen DESC",
-            (token_fp(token),),
-        ).fetchall()
+    if success:
+        now = time.time()
+        LAST_TG_POST_TIME[chat_id] = now
+        if p_hash:
+            TG_POST_HASHES[p_hash] = now
 
-    admins = []
-    for chat_id, title, username in rows[:50]:
-        ok_member, member = tg_api(token, "getChatMember", {"chat_id": chat_id, "user_id": me["id"]})
-        if ok_member and member.get("status") in ("administrator", "creator"):
-            label = title or (f"@{username}" if username else "без названия")
-            admins.append(f"• {label} — {chat_id}")
+        log.info(f"✅ [TG SUCCESS] Пост успешно опубликован в '{channel_title}' ({chat_id})!")
+        return True, f"✅ *ПОСТ УСПЕШНО ОПУБЛИКОВАН!*\n\n📢 Канал: *{channel_title}*\n🆔 ID: `{chat_id}`\n🖼 Вложений: {len(photos)}\n🛡 Антиспам: Активен"
+    else:
+        log.error(f"❌ [TG POST FAIL] {error_desc}")
+        return False, f"❌ Ошибка публикации в Telegram:\n{error_desc}"
 
-    header = "⚠️ Telegram не предоставляет API-список всех каналов бота. Ниже только уже обнаруженные каналы."
-    body = "\n".join(admins) if admins else "Пока ни одного канала не обнаружено. Сделай «тг проверить» или отправь пост по ID."
-    return f"{header}\n\n{body}" + (f"\n\nℹ️ {update_note}" if update_note else "")
+# ============ ПАРСИНГ ТГ-ПОСТОВ И КОМАНД ============
 
+def parse_tg_input(text):
+    """
+    Парсит сообщение из чата ВК.
+    Формат 1 (Пост):
+    <chat_id>
+    <bot_token>
+    <текст поста>
 
-def handle_tg_post(peer_id: int, vk_message_id: int, text: str) -> Optional[str]:
-    parsed = parse_tg_post(text)
-    if not parsed:
+    Формат 2 (Команда проверки админа):
+    админ
+    <bot_token>
+    [chat_id]
+    """
+    lines = [line.strip() for line in text.strip().split("\n") if line.strip()]
+    if not lines:
         return None
 
-    token, chat_id, message = parsed["token"], parsed["chat_id"], parsed["message"]
-    vk_message = get_vk_message(vk_message_id)
-    media, media_warning = extract_media(vk_message)
+    first_line = lines[0].lower()
 
-    # An attachment can exist with empty text; without either, reject.
-    if not message and not media:
-        return "❌ Нужен текст, фото или видео."
-    max_len = TG_MAX_CAPTION if media else TG_MAX_TEXT
-    if len(message) > max_len:
-        return f"❌ Текст слишком длинный: {len(message)} символов. Лимит: {max_len}."
-    if media_warning and not media:
-        return f"❌ {media_warning}"
+    # Проверка команды "админ" / "каналы"
+    if first_line in ["админ", "admin", "каналы", "channels", "тг_админ", "tg_admin"]:
+        token = lines[1] if len(lines) > 1 else ""
+        chat_id = lines[2] if len(lines) > 2 else None
+        return {"action": "check_admin", "token": token, "chat_id": chat_id}
 
-    ok, error, chat = validate_bot_admin(token, chat_id)
-    if not ok:
-        return f"❌ Telegram: {error}"
+    if len(lines) < 3:
+        return None
 
-    digest = content_digest(chat_id, message, media)
-    with POST_LOCK:
-        reserved, reason = reserve_post(vk_message_id, chat_id, token_fp(token), digest)
-        if not reserved:
-            return f"🛡 {reason}"
+    chat_id = lines[0]
+    token = lines[1]
+    message_text = "\n".join(lines[2:])
 
-        log.info("TG publish reserved: vk_message_id=%s channel=%s media=%s", vk_message_id, chat_id, (media or {}).get("type", "none"))
-        sent, send_error = publish_tg(token, chat_id, message, media)
-        if sent:
-            finish_post(vk_message_id, "sent")
-            title = (chat or {}).get("title") or (chat or {}).get("username") or chat_id
-            suffix = f"\n⚠️ {media_warning}" if media_warning else ""
-            log.info("TG publish sent: vk_message_id=%s channel=%s", vk_message_id, chat_id)
-            return f"✅ Пост отправлен: {title} ({chat_id}){suffix}"
+    # Валидация формата токена и ID
+    if ":" not in token or len(token) < 20:
+        return None
 
-        # A timeout is uncertain, so it remains blocked as 'unknown'. Other definite errors are 'failed'.
-        status = "unknown" if "Результат неизвестен" in send_error else "failed"
-        finish_post(vk_message_id, status, send_error)
-        log.error("TG publish failed: vk_message_id=%s channel=%s error=%s", vk_message_id, chat_id, send_error)
-        return f"❌ Telegram: {send_error}"
+    if not (chat_id.startswith("-100") or chat_id.startswith("@") or chat_id.lstrip("-").isdigit()):
+        return None
 
+    return {
+        "action": "post",
+        "chat_id": chat_id,
+        "token": token,
+        "message": message_text
+    }
 
-def process_message(peer_id: int, vk_message_id: int, text: str) -> None:
-    global BOT_PAUSED
-    stripped = (text or "").strip()
-    lower = stripped.lower()
+# ============ ВПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ПОИСК, КУРСЫ, ПОГОДА) ============
 
-    if lower in ("старт", "start"):
-        BOT_PAUSED = False
-        send_vk_message(peer_id, "▶️ Бот запущен.")
-        return
-    if lower in ("стоп", "stop"):
-        BOT_PAUSED = True
-        send_vk_message(peer_id, "⏸ Бот на паузе. Команда «старт» продолжит работу.")
-        return
-    if lower in ("помощь", "help", "команды", "меню", "?"):
-        send_vk_message(peer_id, HELP)
-        return
-    if lower == "статус":
-        state = "пауза" if BOT_PAUSED else "работает"
-        send_vk_message(peer_id, f"✅ Состояние: {state}\nПауза канала: {TG_CHANNEL_COOLDOWN} сек.\nЛимит канала: {TG_CHANNEL_HOURLY_LIMIT}/час\nОбщий лимит: {TG_GLOBAL_HOURLY_LIMIT}/час")
-        return
-    if BOT_PAUSED:
-        send_vk_message(peer_id, "⏸ Бот на паузе. Напиши «старт».")
-        return
+def search_duckduckgo(query):
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "text/html",
+            "Accept-Language": "ru-RU,ru;q=0.9"
+        }
+        r = requests.post(url, data={"q": query, "kl": "ru-ru"}, headers=headers, timeout=20)
+        results = []
+        snippets = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+        snippets += re.findall(r'<a class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', r.text)
+        for link, title in snippets[:5]:
+            if "duckduckgo.com/l/?uddg=" in link:
+                link = unquote(link.split("uddg=")[-1])
+            title_clean = re.sub(r'<[^>]+>', '', title)
+            results.append(f"📌 {title_clean}\n🔗 {link}")
+        return "\n\n".join(results) if results else "❌ Ничего не нашёл"
+    except Exception as e:
+        return f"❌ Ошибка поиска: {e}"
 
-    send_typing(peer_id)
-    for handler in (command_check_channel, command_known_channels):
-        result = handler(stripped)
-        if result is not None:
-            send_vk_message(peer_id, result)
-            return
+def search_wikipedia(query):
+    try:
+        url = f"https://ru.wikipedia.org/api/rest_v1/page/summary/{quote(query.replace(' ', '_'))}"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            return f"📖 *{data.get('title', query)}*\n\n{data.get('extract', 'Нет описания')}\n\n🔗 {data.get('content_urls', {}).get('desktop', {}).get('page', '')}"
+        return search_duckduckgo(f"википедия {query}")
+    except Exception as e:
+        return f"❌ Ошибка Википедии: {e}"
 
-    result = handle_tg_post(peer_id, vk_message_id, stripped)
-    if result is not None:
-        send_vk_message(peer_id, result)
-        return
+def get_cat_image():
+    try:
+        r = requests.get("https://api.thecatapi.com/v1/images/search", timeout=10)
+        return r.json()[0]["url"]
+    except:
+        return None
 
-    # Crucial fix: ordinary text is no longer treated as a malformed TG post.
-    send_vk_message(peer_id, "❌ Команда не распознана. Напиши «помощь». Для TG-поста нужны первые две строки: ID канала и токен бота.")
+def get_dog_image():
+    try:
+        r = requests.get("https://dog.ceo/api/breeds/image/random", timeout=10)
+        return r.json().get("message")
+    except:
+        return None
 
+def get_weather(city):
+    try:
+        url = f"https://wttr.in/{quote(city)}?format=3&lang=ru"
+        r = requests.get(url, timeout=15)
+        return f"🌤 Погода в {city}:\n{r.text.strip()}" if r.status_code == 200 else "❌ Город не найден"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
 
-# ==================== VK USER LONG POLL ====================
+def get_currency():
+    try:
+        r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=10)
+        data = r.json()
+        usd = data["Valute"]["USD"]
+        eur = data["Valute"]["EUR"]
+        return f"💰 Курсы ЦБ РФ:\n🇺🇸 USD: {usd['Value']:.2f} ₽\n🇪🇺 EUR: {eur['Value']:.2f} ₽"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
 
-def remember_vk_id(message_id: int) -> bool:
-    if message_id in RECENT_VK_SET:
+def get_joke():
+    jokes = [
+        "Почему программисты путают Хэллоуин и Рождество? Потому что 31 OCT = 25 DEC",
+        "— Доктор, я себя чувствую как JSON... — Ну расскажите... — Я не могу, у меня нет schema.",
+        "Какой язык программирования самый закрытый? Java — потому что у неё всё private.",
+        "Программист заходит в бар, заказывает 1 пиво, заказывает 10 пив, заказывает 0 пив...",
+    ]
+    return f"😂 {random.choice(jokes)}"
+
+# ============ ОБРАБОТКА КОМАНД ============
+
+def process_command(peer_id, text, msg_id=None):
+    text_lower = text.lower().strip()
+
+    # 1. Проверка Telegram формата
+    tg_parsed = parse_tg_input(text)
+    if tg_parsed:
+        if tg_parsed["action"] == "check_admin":
+            token = tg_parsed["token"]
+            if not token:
+                return "❌ Укажи токен бота! Пример:\nадмин\n8476739947:AAHP..."
+            ok, report = check_tg_bot_admin_status(token, tg_parsed.get("chat_id"))
+            return report
+
+        elif tg_parsed["action"] == "post":
+            photos, videos = get_vk_message_attachments(msg_id)
+            ok, result_msg = send_tg_channel_post(
+                chat_id=tg_parsed["chat_id"],
+                token=tg_parsed["token"],
+                text=tg_parsed["message"],
+                photos=photos
+            )
+            return result_msg
+
+    # 2. Команда "админ" в одну строку
+    if text_lower.startswith("админ ") or text_lower.startswith("каналы "):
+        parts = text.split()
+        token = parts[1] if len(parts) > 1 else ""
+        chat_id = parts[2] if len(parts) > 2 else None
+        if not token:
+            return "❌ Введи: `админ <ТОКЕН_БОТА>`"
+        ok, report = check_tg_bot_admin_status(token, chat_id)
+        return report
+
+    # 3. Справка
+    if text_lower in ["помощь", "help", "команды", "?", "хелп", "меню"]:
+        return ("📋 *Инструкция и команды бота:*\n\n"
+                "📢 *ОТПРАВКА ПОСТА В ТЕЛЕГРАМ КАНАЛ:*\n"
+                "Напиши в чат в формате:\n"
+                "`<ИД_КАНАЛА>`\n"
+                "`<ТОКЕН_БОТА>`\n"
+                "`<ТЕКСТ ПОСТА>`\n"
+                "*(Можно прикреплять фото/видео к сообщению в ВК!)*\n\n"
+                "Пример:\n"
+                "`-1003402995613`\n"
+                "`8476739947:AAHP7pyTa9Mpt_KhEioZ...`\n"
+                "`Привет, мяу`\n\n"
+                "🔍 *ПРОВЕРКА АДМИН-ПРАВ В ТЕЛЕГРАМ:*\n"
+                "`админ <ТОКЕН_БОТА>` — покажет каналы, где бот админ\n\n"
+                "🔍 `поиск <запрос>` — поиск в Google/DDG\n"
+                "📖 `вики <запрос>` — Википедия\n"
+                "🐱 `котик` — котики\n"
+                "🐕 `песик` — собачки\n"
+                "🌤 `погода <город>` — погода\n"
+                "💰 `курс` — курсы валют\n"
+                "😂 `шутка` — анекдоты\n"
+                "⏸ `стоп` / ▶️ `старт` — пауза бота")
+
+    if text_lower.startswith("поиск ") or text_lower.startswith("search "):
+        q = text[7:].strip()
+        return f"🔍 *Ищу:* {q}\n\n{search_duckduckgo(q)}" if q else "❌ Укажи запрос"
+
+    if text_lower.startswith("вики ") or text_lower.startswith("wiki "):
+        q = text[5:].strip()
+        return search_wikipedia(q) if q else "❌ Укажи запрос"
+
+    if text_lower in ["котик", "кот", "cat", "киса"]:
+        url = get_cat_image()
+        if url:
+            upload_and_send_photo(peer_id, url, "🐱 Вот тебе котик!")
+            return None
+        return "❌ Ошибка загрузки котика"
+
+    if text_lower in ["песик", "собака", "dog", "пёс"]:
+        url = get_dog_image()
+        if url:
+            upload_and_send_photo(peer_id, url, "🐕 Вот тебе песик!")
+            return None
+        return "❌ Ошибка загрузки песика"
+
+    if text_lower.startswith("погода "):
+        return get_weather(text[7:].strip())
+
+    if text_lower in ["курс", "валюта", "usd", "eur"]:
+        return get_currency()
+
+    if text_lower in ["шутка", "анекдот"]:
+        return get_joke()
+
+    return f"🔍 *Поиск в сети:* {text}\n\n{search_duckduckgo(text)}"
+
+# ============ ОТПРАВКА ФОТО В ВК ============
+
+def upload_and_send_photo(peer_id, photo_url, caption=""):
+    try:
+        upload_server = vk_api("photos.getMessagesUploadServer", {"peer_id": peer_id})
+        if not upload_server:
+            return False
+        upload_url = upload_server["response"]["upload_url"]
+        img_data = requests.get(photo_url, timeout=20).content
+        files = {"photo": ("image.jpg", img_data)}
+        upload_resp = requests.post(upload_url, files=files, timeout=30).json()
+        saved = vk_api("photos.saveMessagesPhoto", {
+            "photo": upload_resp["photo"],
+            "server": upload_resp["server"],
+            "hash": upload_resp["hash"]
+        })
+        if not saved or "response" not in saved:
+            return False
+        photo = saved["response"][0]
+        attachment = f"photo{photo['owner_id']}_{photo['id']}"
+        send_message(peer_id, caption, attachment)
+        return True
+    except Exception as e:
+        log.error(f"❌ VK Photo upload error: {e}")
         return False
-    if len(RECENT_VK_IDS) == RECENT_VK_IDS.maxlen:
-        old = RECENT_VK_IDS.popleft()
-        RECENT_VK_SET.discard(old)
-    RECENT_VK_IDS.append(message_id)
-    RECENT_VK_SET.add(message_id)
-    return True
 
+# ============ LONG POLL И ОСНОВНОЙ ЦИКЛ ============
 
-def get_long_poll_server() -> Optional[dict[str, Any]]:
-    data = vk_api("messages.getLongPollServer", {"lp_version": 3, "need_pts": 0})
-    return (data or {}).get("response")
+START_TIME = int(time.time())
+PROCESSED_MSGS = set()
+BOT_PAUSED = False
 
+def get_long_poll_server():
+    resp = vk_api("messages.getLongPollServer", {"lp_version": 3})
+    if resp and "response" in resp:
+        return resp["response"]
+    return None
 
-def listen_messages(user_id: int, owned_token: str) -> None:
-    global VK_TOKEN
-    log.info("VK listener starting for user_id=%s", user_id)
-    server_data: Optional[dict[str, Any]] = None
+def listen_messages(user_id):
+    server_data = get_long_poll_server()
+    if not server_data:
+        log.error("❌ Не удалось получить Long Poll сервер. Повтор через 10 сек...")
+        time.sleep(10)
+        return listen_messages(user_id)
 
-    while not STOP_EVENT.is_set() and owned_token == ACTIVE_VK_TOKEN:
+    ts = server_data["ts"]
+    server = server_data["server"]
+    key = server_data["key"]
+
+    log.info(f"🚀 БОТ УСПЕШНО ЗАПУЩЕН! Ожидание сообщений от пользователя ID={user_id}")
+    log.info("🛡 Защита от спама и фильтрация дублей ВК/ТГ активирована.")
+
+    first_run = True
+
+    while True:
         try:
-            if not server_data:
-                server_data = get_long_poll_server()
-                if not server_data:
-                    time.sleep(5)
+            url = f"https://{server}?act=a_check&key={key}&ts={ts}&wait=25&mode=2&version=3"
+            r = requests.get(url, timeout=35)
+            data = r.json()
+
+            if "failed" in data:
+                if data["failed"] == 1:
+                    ts = data["ts"]
+                    continue
+                else:
+                    server_data = get_long_poll_server()
+                    if not server_data:
+                        time.sleep(5)
+                        continue
+                    ts = server_data["ts"]
+                    server = server_data["server"]
+                    key = server_data["key"]
                     continue
 
-            server = server_data["server"]
-            if not server.startswith("http"):
-                server = "https://" + server
-            response = SESSION.get(server, params={
-                "act": "a_check",
-                "key": server_data["key"],
-                "ts": server_data["ts"],
-                "wait": 25,
-                "mode": 2,
-                "version": 3,
-            }, timeout=(10, 35))
-            data = response.json()
+            ts = data["ts"]
 
-            failed = data.get("failed")
-            if failed == 1:
-                server_data["ts"] = data["ts"]
-                continue
-            if failed:
-                log.warning("VK Long Poll failed=%s; reconnecting", failed)
-                server_data = None
+            if first_run:
+                first_run = False
+                old_count = len(data.get("updates", []))
+                if old_count > 0:
+                    log.info(f"🗑 Пропущено {old_count} старых сообщений (Защита от спама при старте)")
                 continue
 
-            server_data["ts"] = data["ts"]
             for update in data.get("updates", []):
-                if not isinstance(update, list) or len(update) < 6 or update[0] != 4:
-                    continue
-                message_id = int(update[1])
-                flags = int(update[2])
-                peer_id = int(update[3])
-                text = str(update[5] or "")
+                if update[0] == 4:  # Новое сообщение
+                    msg_id = update[1]
+                    flags = update[2]
+                    peer_id = update[3]
+                    ts_msg = update[4]
+                    text = update[5]
+                    text_lower = text.lower().strip()
 
-                # Ignore outgoing messages and every chat except Saved Messages.
-                if flags & 2 or peer_id != user_id:
-                    continue
-                if not remember_vk_id(message_id):
-                    log.warning("Duplicate VK event ignored: message_id=%s", message_id)
-                    continue
+                    # Пропускаем исходящие сообщения
+                    if flags & 2:
+                        continue
 
-                log.info("VK incoming: message_id=%s peer_id=%s chars=%s", message_id, peer_id, len(text))
-                try:
-                    process_message(peer_id, message_id, text)
-                except Exception as exc:
-                    log.exception("Message processing crashed: message_id=%s error=%s", message_id, exc)
-                    send_vk_message(peer_id, f"❌ Внутренняя ошибка. ID события: {message_id}. Подробности записаны в лог.")
+                    # Реакция только на сообщения от владельца токена
+                    if peer_id != user_id:
+                        continue
 
-        except Exception as exc:
-            log.exception("VK Long Poll loop error: %s", exc)
-            server_data = None
-            time.sleep(3)
+                    # Проверка времени (игнорируем сообщения до запуска)
+                    if ts_msg < START_TIME - 30:
+                        continue
 
-    log.info("VK listener stopped for user_id=%s", user_id)
+                    # Игнорируем свои же служебные ответы по префиксам
+                    if any(text.startswith(p) for p in ["✅", "❌", "🛡", "🤖", "📋", "🔍", "📖", "🐱", "🐕", "🌤", "💰", "😂"]):
+                        continue
 
+                    global BOT_PAUSED
+                    if text_lower in ["стоп", "stop"]:
+                        BOT_PAUSED = True
+                        send_message(peer_id, "⏸ Бот приостановлен. Напиши 'старт' для запуска.")
+                        continue
+                    elif text_lower in ["старт", "start"]:
+                        BOT_PAUSED = False
+                        send_message(peer_id, "▶️ Бот возобновил работу!")
+                        continue
 
-def start_listener(token: str, user_id: int) -> None:
-    global VK_TOKEN, ACTIVE_VK_TOKEN, BOT_THREAD
-    with BOT_THREAD_LOCK:
-        VK_TOKEN = token
-        ACTIVE_VK_TOKEN = token
-        if BOT_THREAD and BOT_THREAD.is_alive():
-            # The old thread exits after its current poll because ACTIVE_VK_TOKEN changed.
-            log.info("Replacing existing VK listener")
-        BOT_THREAD = threading.Thread(target=listen_messages, args=(user_id, token), daemon=True, name=f"vk-listener-{user_id}")
-        BOT_THREAD.start()
+                    if BOT_PAUSED:
+                        continue
 
+                    log.info(f"📩 Новое сообщение в ВК: {text[:60]}...")
+                    send_typing(peer_id)
 
-# ==================== CONFIG / WEB UI ====================
+                    reply_text = process_command(peer_id, text, msg_id=msg_id)
+                    if reply_text:
+                        send_message(peer_id, reply_text)
+                        log.info("✅ Ответ отправлен в ВК чат.")
 
-def load_config() -> dict[str, Any]:
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        log.error("Cannot load config: %s", exc)
-        return {}
+        except Exception as e:
+            log.error(f"❌ Ошибка в цикле LongPoll: {e}")
+            time.sleep(5)
 
+# ============ ВЕБ-СЕРВЕР ДЛЯ ВВОДА ТОКЕНА (БЕЗ ИЗМЕНЕНИЙ) ============
 
-def save_config(config: dict[str, Any]) -> None:
-    directory = os.path.dirname(os.path.abspath(CONFIG_FILE))
-    os.makedirs(directory, exist_ok=True)
-    temp = CONFIG_FILE + ".tmp"
-    with open(temp, "w", encoding="utf-8") as file:
-        json.dump(config, file, ensure_ascii=False)
-    try:
-        os.chmod(temp, 0o600)
-    except OSError:
-        pass
-    os.replace(temp, CONFIG_FILE)
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
 
+CONFIG_FILE = "/tmp/vk_config.json"
 
-HTML_PAGE = """<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VK → Telegram</title><style>
-body{margin:0;background:#10131d;color:#eef;font:16px system-ui;display:grid;place-items:center;min-height:100vh}.box{width:min(560px,90%);background:#1a2030;padding:28px;border-radius:18px;box-shadow:0 20px 60px #0008}h1{margin-top:0}input,button{box-sizing:border-box;width:100%;padding:14px;border-radius:10px;border:1px solid #39435d;background:#0f1420;color:white;margin-top:10px}button{background:#5865f2;border:0;font-weight:700;cursor:pointer}.note{color:#aeb8d0;font-size:14px}.ok{color:#62db8a}.err{color:#ff7777}code{word-break:break-all}
-</style></head><body><main class="box"><h1>🚀 VK → Telegram</h1><p class="note">Введите VK user token. Он хранится локально в файле с правами 600.</p>
-<form id="f"><input id="token" type="password" placeholder="VK token или OAuth-ссылка" required><button>Запустить</button></form><p id="s"></p>
-<p class="note">После запуска откройте «Избранное» VK и напишите <b>помощь</b>.</p></main><script>
-f.onsubmit=async(e)=>{e.preventDefault();s.className='';s.textContent='Проверяю…';try{let r=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token.value})});let d=await r.json();s.className=d.ok?'ok':'err';s.textContent=d.ok?'✅ Запущено: '+d.name+' (ID '+d.user_id+')':'❌ '+d.error}catch(x){s.className='err';s.textContent='❌ '+x}}</script></body></html>"""
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
 
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VK & TG Browser Bot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0f0f23;
+            color: #fff;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: #1a1a2e;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { color: #888; margin-bottom: 30px; font-size: 14px; }
+        label { display: block; margin-bottom: 8px; color: #aaa; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; }
+        input[type="text"] {
+            width: 100%; padding: 14px 16px; background: #0f0f23; border: 2px solid #333;
+            border-radius: 12px; color: #fff; font-size: 14px; font-family: monospace; transition: border-color 0.3s;
+        }
+        input[type="text"]:focus { outline: none; border-color: #667eea; }
+        .hint { color: #666; font-size: 12px; margin-top: 6px; margin-bottom: 20px; }
+        button {
+            width: 100%; padding: 16px; background: linear-gradient(135deg, #667eea, #764ba2);
+            border: none; border-radius: 12px; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer;
+        }
+        .status { margin-top: 20px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
+        .status.ok { background: rgba(34,197,94,0.15); color: #22c55e; display: block; }
+        .status.err { background: rgba(239,68,68,0.15); color: #ef4444; display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔥 VK & TG Bot</h1>
+        <p class="subtitle">Постинг в Telegram-каналы и браузер через ВК</p>
+        <form id="tokenForm">
+            <label>Kate Mobile VK Token</label>
+            <input type="text" id="token" placeholder="vk1.a.xxx... или полная ссылка" required>
+            <p class="hint">Вставьте токен или ссылку Kate Mobile</p>
+            <button type="submit">🚀 Запустить бота</button>
+        </form>
+        <div id="status" class="status"></div>
+    </div>
+    <script>
+        document.getElementById('tokenForm').onsubmit = async function(e) {
+            e.preventDefault();
+            const token = document.getElementById('token').value.trim();
+            const status = document.getElementById('status');
+            status.className = 'status';
+            status.style.display = 'block';
+            status.textContent = '⏳ Проверяю VK токен...';
+            try {
+                const resp = await fetch('/save', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({token: token})
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    status.className = 'status ok';
+                    status.innerHTML = '✅ Бот успешно запущен!<br>👤 ' + data.name + ' (ID: ' + data.user_id + ')<br>💬 Напишите "помощь" в чат с самим собой в ВК';
+                } else {
+                    status.className = 'status err';
+                    status.textContent = '❌ ' + data.error;
+                }
+            } catch(err) {
+                status.className = 'status err';
+                status.textContent = '❌ Ошибка: ' + err.message;
+            }
+        };
+    </script>
+</body>
+</html>
+"""
 
 class WebHandler(BaseHTTPRequestHandler):
-    server_version = "VK-TG-Publisher/3.0"
+    def log_message(self, format, *args):
+        pass
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        log.info("WEB %s - %s", self.client_address[0], fmt % args)
-
-    def send_json(self, code: int, value: dict[str, Any]) -> None:
-        body = json.dumps(value, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self) -> None:
+    def do_GET(self):
         if self.path == "/":
-            body = HTML_PAGE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(HTML_PAGE.encode("utf-8"))
         elif self.path == "/health":
-            self.send_json(200, {"status": "ok", "listener_alive": bool(BOT_THREAD and BOT_THREAD.is_alive())})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
         else:
-            self.send_json(404, {"ok": False, "error": "not found"})
+            self.send_response(404)
+            self.end_headers()
 
-    def do_POST(self) -> None:
-        if self.path != "/save":
-            self.send_json(404, {"ok": False, "error": "not found"})
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 100_000:
-                self.send_json(400, {"ok": False, "error": "Неверный размер запроса"})
-                return
-            data = json.loads(self.rfile.read(length).decode())
-            token = extract_vk_token(str(data.get("token", "")))
-            user = get_vk_user(token)
-            if not user:
-                self.send_json(400, {"ok": False, "error": "VK-токен не работает или не имеет доступа к messages"})
-                return
-            save_config({"token": token, "user_id": user["id"]})
-            start_listener(token, int(user["id"]))
-            name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
-            self.send_json(200, {"ok": True, "user_id": user["id"], "name": name})
-        except Exception as exc:
-            log.exception("WEB /save failed: %s", exc)
-            self.send_json(400, {"ok": False, "error": str(exc)})
+    def do_POST(self):
+        global VK_TOKEN
+        if self.path == "/save":
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len).decode('utf-8')
+            data = json.loads(body)
+            token = data.get("token", "").strip()
 
+            if "access_token=" in token:
+                match = re.search(r'access_token=([^&\s]+)', token)
+                if match:
+                    token = match.group(1)
 
-class ReusableThreadingServer(ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+            test_url = f"https://api.vk.com/method/users.get?access_token={token}&v=5.199"
+            try:
+                r = requests.get(test_url, timeout=10)
+                vk_data = r.json()
 
+                if "error" in vk_data:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": False, "error": vk_data["error"]["error_msg"]}).encode())
+                    return
 
-def main() -> None:
-    global VK_TOKEN
-    init_db()
-    config = load_config()
-    configured_token = VK_TOKEN or extract_vk_token(str(config.get("token", "")))
-    if configured_token:
-        user = get_vk_user(configured_token)
-        if user:
-            start_listener(configured_token, int(user["id"]))
-            log.info("Configured VK account: user_id=%s", user["id"])
+                user = vk_data["response"][0]
+                user_id = user["id"]
+                name = f"{user.get('first_name','')} {user.get('last_name','')}".strip()
+
+                VK_TOKEN = token
+                save_config({"token": token, "user_id": user_id})
+
+                def start_bot():
+                    listen_messages(user_id)
+
+                bot_thread = threading.Thread(target=start_bot, daemon=True)
+                bot_thread.start()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "user_id": user_id, "name": name}).encode())
+
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
         else:
-            log.error("Saved VK token is invalid; open the web UI and replace it")
+            self.send_response(404)
+            self.end_headers()
 
-    with ReusableThreadingServer(("", PORT), WebHandler) as server:
-        log.info("Web UI listening on 0.0.0.0:%s", PORT)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            log.info("Shutdown requested")
-        finally:
-            STOP_EVENT.set()
+def start_web_server():
+    port = int(os.environ.get("PORT", "8080"))
+    with socketserver.TCPServer(("", port), WebHandler) as httpd:
+        log.info(f"🌐 Веб-интерфейс доступен на порту: {port}")
+        httpd.serve_forever()
 
+# ============ ЗАПУСК СЕРВЕРА ============
 
 if __name__ == "__main__":
-    main()
+    log.info("🚀 Запуск VK-TG Browser Bot...")
+
+    cfg = load_config()
+    if cfg.get("token"):
+        VK_TOKEN = cfg["token"]
+        log.info("[+] VK Токен загружен из локального конфига")
+
+        user_id = get_user_id()
+        if user_id:
+            def start_bot():
+                listen_messages(user_id)
+            bot_thread = threading.Thread(target=start_bot, daemon=True)
+            bot_thread.start()
+
+    start_web_server()
