@@ -9,5 +9,3 @@ COPY main.py .
 
 CMD ["python", "main.py"]
 
-
-requests>=2.31.0
