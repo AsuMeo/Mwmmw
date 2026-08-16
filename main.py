@@ -6,9 +6,10 @@ import time
 import random
 import logging
 import threading
-import requests
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import socketserver
+import requests
 
 # ============ НАСТРОЙКИ И ЛОГИ ============
 logging.basicConfig(
@@ -185,7 +186,6 @@ def get_channel_map():
     channels_list = []
     seen_ids = set()
 
-    # 1. Сначала из веб-панели
     for key, c_info in CHANNELS_CONFIG.items():
         cid = str(c_info["id"]).strip()
         if cid and cid not in seen_ids:
@@ -196,7 +196,6 @@ def get_channel_map():
                 "username": ""
             })
 
-    # 2. Из автообнаружения в Telegram
     for cid, info in DISCOVERED_CHANNELS.items():
         cid_str = str(cid).strip()
         if cid_str and cid_str not in seen_ids:
@@ -207,14 +206,12 @@ def get_channel_map():
                 "username": info.get("username", "")
             })
 
-    # Присваиваем порядковый индекс 1, 2, 3...
     for idx, ch in enumerate(channels_list, 1):
         ch["index"] = idx
 
     return channels_list
 
 def get_all_active_channels():
-    """Собирает и проверяет все каналы из автопоиска Telegram и из настроек"""
     poll_tg_updates()
     channels_list = get_channel_map()
 
@@ -249,7 +246,6 @@ def get_all_active_channels():
     return final_channels
 
 def find_channel_by_input(input_str):
-    """Быстрый и точный поиск канала по названию, индексу или ID"""
     if not input_str:
         return None, None
 
@@ -338,12 +334,13 @@ def send_typing(peer_id):
     vk_api("messages.setActivity", {"peer_id": peer_id, "type": "typing"})
 
 def get_vk_message_attachments(msg_id):
-    """Извлекает прямые ссылки на фото и видео из ВК сообщения"""
+    """Извлекает прямые ссылки на фото, видео и аудио из ВК сообщения"""
     if not msg_id:
-        return [], []
+        return [], [], []
     resp = vk_api("messages.getById", {"message_ids": msg_id})
     photos = []
     videos = []
+    audios = []
     if resp and "response" in resp and resp["response"]["items"]:
         msg_item = resp["response"]["items"][0]
         for att in msg_item.get("attachments", []):
@@ -354,11 +351,33 @@ def get_vk_message_attachments(msg_id):
                     best_size = max(sizes, key=lambda x: x.get("width", 0) * x.get("height", 0))
                     photos.append(best_size.get("url"))
             elif att_type == "video" and "video" in att:
+                # Видео из ВК
+                v_files = att["video"].get("files", {})
+                v_url = v_files.get("external") or v_files.get("mp4_720") or v_files.get("mp4_480") or v_files.get("mp4_360")
+                if not v_url and "player" in att["video"]:
+                    v_url = att["video"]["player"]
+                if v_url:
+                    videos.append(v_url)
                 img_sizes = att["video"].get("image", [])
                 if img_sizes:
                     best_img = max(img_sizes, key=lambda x: x.get("width", 0) * x.get("height", 0))
                     photos.append(best_img.get("url"))
-    return photos, videos
+            elif att_type == "audio" and "audio" in att:
+                a_url = att["audio"].get("url")
+                if a_url:
+                    audios.append(a_url)
+            elif att_type == "doc" and "doc" in att:
+                doc = att["doc"]
+                d_type = doc.get("type", 0)
+                d_url = doc.get("url")
+                if d_url:
+                    if d_type == 3 or doc.get("ext") in ["mp4", "mov", "avi", "mkv"]:
+                        videos.append(d_url)
+                    elif d_type == 5 or doc.get("ext") in ["mp3", "wav", "m4a", "ogg", "aac"]:
+                        audios.append(d_url)
+                    elif doc.get("ext") in ["jpg", "jpeg", "png", "webp"]:
+                        photos.append(d_url)
+    return photos, videos, audios
 
 def get_user_id():
     resp = vk_api("users.get", {})
@@ -386,7 +405,6 @@ def tg_api(method, payload=None, token_override=None):
         return {"ok": False, "description": str(e)}
 
 def check_tg_bot_admin_status():
-    """Автоматическая проверка и вывод списка каналов Telegram, где бот админ"""
     if not TG_TOKEN:
         return "❌ Токен Telegram бота не настроен на сайте!"
 
@@ -406,9 +424,8 @@ def check_tg_bot_admin_status():
             "⚠️ *Каналы пока не найдены!*\n\n"
             "💡 *Как подключить канал:*\n"
             "1. Добавьте бота в ваш Telegram-канал как АДМИНИСТРАТОРА.\n"
-            "2. Опубликуйте любое сообщение в канале (или отправьте пост).\n"
-            "3. Повторно напишите команду `каналы` в чат ВК!\n\n"
-            "Также можно указать ID канала на веб-панели управления."
+            "2. Опубликуйте любое сообщение в канале.\n"
+            "3. Напишите `каналы` в чат ВК!"
         )
 
     reports = []
@@ -422,38 +439,29 @@ def check_tg_bot_admin_status():
         if st in ["administrator", "creator"]:
             status_str = "👑 АДМИНИСТРАТОР (Готов к публикациям)"
         elif st == "member":
-            status_str = "⚠️ УЧАСТНИК — Сделайте бота администратором канала!"
+            status_str = "⚠️ УЧАСТНИК — Сделайте бота администратором!"
         else:
             status_str = f"⚙️ Статус: {st}"
 
         reports.append(
             f"{idx}️⃣ *{title}*{uname}\n"
             f"🆔 ID: `{cid}`\n"
-            f"📌 Варианты отправки:\n"
-            f"• `{idx}`\n`Мяу мяу`\n"
-            f"• `{idx} - мяу мяу`\n"
-            f"• `{idx}мяумяу`\n"
-            f"• `{cid} - мяу мяу`\n"
             f"Статус: {status_str}"
         )
 
     report = (
         f"🤖 *Бот Telegram:* {bot_name} (@{bot_user})\n"
-        f"📋 *Найдено подключенных каналов/чатов: {len(channels)}*\n\n" +
+        f"📋 *Найдено каналов/чатов: {len(channels)}*\n\n" +
         "\n\n".join(reports) +
-        "\n\n💬 *Способы отправки из ВК:*\n"
-        "1) С переносом строки:\n`1`\n`Мяу мяу`\n\n"
-        "2) Через тире в одну строчку:\n`1 - Мяу мяу`\n\n"
-        "3) Слитно:\n`1мяумяу`\n\n"
-        "4) С ID канала:\n`-100123456789 - Мяу мяу`"
+        "\n\n💾 *Доступные каналы автоматически сохраняются!*"
     )
     return report
 
 # ============ ЗАЩИТА ОТ СПАМА И ДУБЛЕЙ ============
 LAST_TG_POST_TIME = {}
 TG_POST_HASHES = {}
-MIN_POST_INTERVAL = 2      # Секунд между постами
-DUPLICATE_COOLDOWN = 180   # Кулдаун одинаковых постов (3 минуты)
+MIN_POST_INTERVAL = 2
+DUPLICATE_COOLDOWN = 180
 
 def validate_anti_spam(chat_id, text, photos=None):
     now = time.time()
@@ -463,8 +471,7 @@ def validate_anti_spam(chat_id, text, photos=None):
     last_hash_time = TG_POST_HASHES.get(post_hash, 0)
     if now - last_hash_time < DUPLICATE_COOLDOWN:
         remaining = int(DUPLICATE_COOLDOWN - (now - last_hash_time))
-        log.warning(f"🛡 [СПАМ-ФИЛЬТР] Повторный пост заблокирован для {chat_id}")
-        return False, f"🛡 *ЗАЩИТА ОТ СПАМА:*\nЭтот пост уже недавно отправлялся в канал `{chat_id}`!\nПовторить можно через {remaining} сек."
+        return False, f"🛡 *ЗАЩИТА ОТ СПАМА:*\nЭтот пост уже недавно отправлялся! Повторить через {remaining} сек."
 
     last_post = LAST_TG_POST_TIME.get(chat_id, 0)
     if now - last_post < MIN_POST_INTERVAL:
@@ -476,13 +483,14 @@ def validate_anti_spam(chat_id, text, photos=None):
 
     return True, post_hash
 
-# ============ ПУБЛИКАЦИЯ В ТЕЛЕГРАМ ============
+# ============ ПУБЛИКАЦИЯ В ТЕЛЕГРАМ (ФОТО / ВИДЕО / АУДИО) ============
 
-def send_tg_channel_post(chat_id, text, photos=None):
-    if photos is None:
-        photos = []
+def send_tg_channel_post(chat_id, text, photos=None, videos=None, audios=None):
+    if photos is None: photos = []
+    if videos is None: videos = []
+    if audios is None: audios = []
 
-    log.info(f"🚀 Публикация в TG {chat_id} | Фото: {len(photos)}")
+    log.info(f"🚀 Публикация в TG {chat_id} | Фото: {len(photos)} | Видео: {len(videos)} | Аудио: {len(audios)}")
 
     is_safe, p_hash = validate_anti_spam(chat_id, text, photos)
     if not is_safe:
@@ -491,14 +499,39 @@ def send_tg_channel_post(chat_id, text, photos=None):
     chat_info = tg_api("getChat", {"chat_id": chat_id})
     if not chat_info.get("ok"):
         err = chat_info.get("description", "Канал не найден")
-        log.error(f"❌ Ошибка доступа к каналу {chat_id}: {err}")
-        return False, f"❌ Ошибка канала `{chat_id}`:\n{err}\n\nПроверь, добавлен ли бот в канал как администратор!"
+        return False, f"❌ Ошибка канала `{chat_id}`:\n{err}\n\nПроверьте, добавлен ли бот в канал как администратор!"
 
     channel_title = chat_info.get("result", {}).get("title", chat_id)
+    res = {"ok": False, "description": "Нет вложений"}
 
-    # Выполняем отправку
-    if len(photos) > 1:
-        # Несколько фото -> MediaGroup
+    # 1. Отправка видео, если есть
+    if videos:
+        for v_idx, v_item in enumerate(videos[:5]):
+            cap = text[:1024] if v_idx == 0 else ""
+            payload = {"chat_id": chat_id, "video": v_item, "caption": cap}
+            if cap: payload["parse_mode"] = "HTML"
+            r = tg_api("sendVideo", payload)
+            if r.get("ok"): res = r
+            else:
+                payload.pop("parse_mode", None)
+                r = tg_api("sendVideo", payload)
+                if r.get("ok"): res = r
+
+    # 2. Отправка аудио, если есть
+    if audios:
+        for a_idx, a_item in enumerate(audios[:5]):
+            cap = text[:1024] if (a_idx == 0 and not videos) else ""
+            payload = {"chat_id": chat_id, "audio": a_item, "caption": cap}
+            if cap: payload["parse_mode"] = "HTML"
+            r = tg_api("sendAudio", payload)
+            if r.get("ok"): res = r
+            else:
+                payload.pop("parse_mode", None)
+                r = tg_api("sendAudio", payload)
+                if r.get("ok"): res = r
+
+    # 3. Отправка фото / медиагруппы
+    if len(photos) > 1 and not videos and not audios:
         media = []
         for idx, p_url in enumerate(photos[:10]):
             m_item = {"type": "photo", "media": p_url}
@@ -508,31 +541,18 @@ def send_tg_channel_post(chat_id, text, photos=None):
             media.append(m_item)
         res = tg_api("sendMediaGroup", {"chat_id": chat_id, "media": media})
         if not res.get("ok"):
-            # Повтор без HTML
-            for m in media:
-                m.pop("parse_mode", None)
+            for m in media: m.pop("parse_mode", None)
             res = tg_api("sendMediaGroup", {"chat_id": chat_id, "media": media})
 
-    elif len(photos) == 1:
-        # Одно фото
-        payload = {
-            "chat_id": chat_id,
-            "photo": photos[0],
-            "caption": text[:1024],
-            "parse_mode": "HTML"
-        }
+    elif len(photos) == 1 and not videos and not audios:
+        payload = {"chat_id": chat_id, "photo": photos[0], "caption": text[:1024], "parse_mode": "HTML"}
         res = tg_api("sendPhoto", payload)
         if not res.get("ok"):
             payload.pop("parse_mode", None)
             res = tg_api("sendPhoto", payload)
-    else:
-        # Только текст
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }
+
+    elif not photos and not videos and not audios and text:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False}
         res = tg_api("sendMessage", payload)
         if not res.get("ok"):
             payload.pop("parse_mode", None)
@@ -542,12 +562,245 @@ def send_tg_channel_post(chat_id, text, photos=None):
         now = time.time()
         LAST_TG_POST_TIME[chat_id] = now
         TG_POST_HASHES[p_hash] = now
-        log.info(f"✅ Пост опубликован в '{channel_title}'!")
-        return True, f"✅ *ПОСТ УСПЕШНО ОПУБЛИКОВАН!*\n\n📢 Канал: *{channel_title}*\n🆔 ID: `{chat_id}`\n🖼 Вложений: {len(photos)}"
+        return True, f"✅ *ПОСТ УСПЕШНО ОПУБЛИКОВАН!*\n\n📢 Канал: *{channel_title}*\n🆔 ID: `{chat_id}`\n🖼 Фото: {len(photos)} | 🎬 Видео: {len(videos)} | 🎵 Аудио: {len(audios)}"
     else:
         err = res.get("description", "Неизвестная ошибка")
-        log.error(f"❌ Ошибка публикации: {err}")
         return False, f"❌ Ошибка отправки в Telegram:\n{err}"
+
+# ============ ПАРСЕР ТГ КАНАЛОВ И СКАЧИВАТЕЛЬ ВИДЕО (YT-DLP) ============
+
+def parse_external_tg_channel(url_or_username):
+    """Парсит публичный Telegram канал по ссылке без необходимости добавления бота в канал"""
+    clean_url = url_or_username.strip()
+    if clean_url.startswith("https://t.me/"):
+        username = clean_url.replace("https://t.me/", "").strip("/@")
+    elif clean_url.startswith("t.me/"):
+        username = clean_url.replace("t.me/", "").strip("/@")
+    elif clean_url.startswith("@"):
+        username = clean_url.strip("@")
+    else:
+        username = clean_url
+
+    if not username:
+        return "❌ Неверная ссылка на Telegram канал!"
+
+    web_url = f"https://t.me/s/{username}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    try:
+        r = requests.get(web_url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return f"❌ Не удалось открыть канал `@{username}` (код {r.status_code}). Убедитесь, что канал публичный."
+        
+        from html.parser import HTMLParser
+
+        class TGParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.posts = []
+                self.current_post = {"text": "", "images": []}
+                self.in_text = False
+                self.in_media = False
+
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs)
+                cls = attrs_dict.get("class", "")
+                if "tgme_widget_message_text" in cls:
+                    if self.current_post["text"] or self.current_post["images"]:
+                        self.posts.append(self.current_post)
+                        self.current_post = {"text": "", "images": []}
+                    self.in_text = True
+                elif "tgme_widget_message_photo" in cls:
+                    style = attrs_dict.get("style", "")
+                    m = re.search(r'background-image:\s*url\(\'(.*?)\'\)', style)
+                    if m:
+                        self.current_post["images"].append(m.group(1))
+
+            def handle_data(self, data):
+                if self.in_text:
+                    self.current_post["text"] += data
+
+            def handle_endtag(self, tag):
+                if tag == "div" and self.in_text:
+                    self.in_text = False
+
+        parser = TGParser()
+        parser.feed(r.text)
+        if parser.current_post["text"] or parser.current_post["images"]:
+            parser.posts.append(parser.current_post)
+
+        if not parser.posts:
+            return f"⚠️ Постов в канале `@{username}` не найдено или структура изменилась."
+
+        last_posts = parser.posts[-10:] # Последние до 10 постов
+        result_lines = [f"📢 *Последние посты из канала @{username} (Парсер):*\n"]
+        
+        for idx, p in enumerate(reversed(last_posts), 1):
+            txt = p["text"].strip()
+            if len(txt) > 300:
+                txt = txt[:300] + "..."
+            imgs = p["images"]
+            result_lines.append(f"{idx}️⃣ {txt if txt else '[Медиа пост]'}\n🖼 Картинок: {len(imgs)}\n")
+
+        return "\n".join(result_lines)
+    except Exception as e:
+        log.error(f"❌ Ошибка парсинга ТГ канала: {e}")
+        return f"❌ Ошибка при парсинге канала: {e}"
+
+def download_video_yt_dlp(url):
+    """Скачивает видео с YouTube, TikTok и др. с помощью yt-dlp для отправки в ВК"""
+    url = url.strip()
+    output_template = f"/tmp/video_{int(time.time())}.%(ext)s"
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "-f", "best[ext=mp4]/best",
+        "--max-filesize", "50M",
+        "-o", output_template,
+        url
+    ]
+    try:
+        log.info(f"📥 Загрузка видео через yt-dlp: {url}")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if res.returncode != 0:
+            log.error(f"❌ yt-dlp error: {res.stderr}")
+            return None
+        
+        # Ищем скачанный файл
+        for f in os.listdir("/tmp"):
+            if f.startswith(f"video_{int(time.time()) // 1000}") or f.startswith("video_"):
+                f_path = os.path.join("/tmp", f)
+                if os.path.exists(f_path) and os.path.getsize(f_path) > 1000:
+                    return f_path
+    except Exception as e:
+        log.error(f"❌ Ошибка загрузки видео: {e}")
+    return None
+
+def upload_video_to_vk(peer_id, file_path):
+    """Загружает видеофайл напрямую в ВК документы/сообщения"""
+    try:
+        # 1. Получаем сервер загрузки документов для личных сообщений
+        srv = vk_api("docs.getMessagesUploadServer", {"peer_id": peer_id, "type": "doc"})
+        if not srv or "response" not in srv:
+            return None
+        upload_url = srv["response"]["upload_url"]
+
+        with open(file_path, "rb") as f:
+            files = {"file": f}
+            r = requests.post(upload_url, files=files, timeout=60)
+            resp_data = r.json()
+
+        if "file" not in resp_data:
+            return None
+
+        # 2. Сохраняем документ
+        saved = vk_api("docs.save", {"file": resp_data["file"], "title": "downloaded_video.mp4"})
+        if saved and "response" in saved:
+            doc = saved["response"].get("doc") or saved["response"][0]
+            owner_id = doc["owner_id"]
+            doc_id = doc["id"]
+            return f"doc{owner_id}_{doc_id}"
+    except Exception as e:
+        log.error(f"❌ Ошибка загрузки видео в VK: {e}")
+    return None
+
+# ============ ИНТЕРНЕТ ПОИСК И КРУТЫЕ КОМАНДЫ (ВК БЕЗЛИМИТ) ============
+
+def internet_search(query):
+    """Поиск в интернете через DuckDuckGo API/Instant Answer"""
+    try:
+        url = "https://api.duckduckgo.com/"
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1", "kl": "ru-ru"}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        
+        abstract = data.get("AbstractText")
+        if abstract:
+            return f"🌐 *Результат поиска (Интернет):*\n\n{abstract}"
+        
+        related = data.get("RelatedTopics", [])
+        for rel in related:
+            if isinstance(rel, dict) and "Text" in rel:
+                return f"🌐 *Результат поиска (Интернет):*\n\n{rel['Text']}"
+        
+        # Fallback на парсинг HTML DuckDuckGo Lite если API пустой
+        lite_url = "https://lite.duckduckgo.com/lite/"
+        r2 = requests.post(lite_url, data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r2.status_code == 200:
+            from html.parser import HTMLParser
+            class DDGLiteParser(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.results = []
+                    self.capture = False
+                def handle_starttag(self, tag, attrs):
+                    if tag == "a" and any(attr[0] == "class" and "result-snippet" in attr[1] for attr in attrs):
+                        self.capture = True
+                def handle_data(self, data):
+                    if self.capture:
+                        self.results.append(data.strip())
+                        self.capture = False
+            p = DDGLiteParser()
+            p.feed(r2.text)
+            if p.results:
+                return f"🌐 *Интернет поиск по запросу '{query}':*\n\n• " + "\n\n• ".join(p.results[:3])
+
+        return f"🌐 По запросу «{query}» ничего точного не найдено в открытых источниках."
+    except Exception as e:
+        log.error(f"❌ Ошибка интернет поиска: {e}")
+        return f"❌ Ошибка при выполнении интернет-поиска: {e}"
+
+def get_weather(city="Москва"):
+    """Получает погоду в градусах Цельсия"""
+    try:
+        url = f"https://wttr.in/{requests.utils.quote(city)}?format=3&lang=ru"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and len(r.text) < 150:
+            return f"🌤 *Погода в городе {city}:*\n{r.text.strip()}"
+        
+        # Полный прогноз wttr.in
+        url2 = f"https://wttr.in/{requests.utils.quote(city)}?format=%C+%t,+ощущается+как+%f,+ветер+%w,+влажность+%h&lang=ru"
+        r2 = requests.get(url2, timeout=10)
+        if r2.status_code == 200:
+            return f"🌤 *Погода в городе {city}:*\n{r2.text.strip()}"
+    except Exception as e:
+        log.error(f"❌ Ошибка получения погоды: {e}")
+    return f"🌤 Не удалось получить погоду для «{city}». Попробуйте: `погода Москва`"
+
+def get_random_cat():
+    """Случайный кот (картинка)"""
+    try:
+        r = requests.get("https://api.thecatapi.com/v1/images/search", timeout=10)
+        data = r.json()
+        if data and isinstance(data, list):
+            return data[0].get("url")
+    except Exception:
+        pass
+    # Резервный котик
+    return f"https://cataas.com/cat?t={time.time()}"
+
+def get_random_dog():
+    """Случайная собачка"""
+    try:
+        r = requests.get("https://dog.ceo/api/breeds/image/random", timeout=10)
+        data = r.json()
+        if data.get("status") == "success":
+            return data.get("message")
+    except Exception:
+        pass
+    return "https://images.dog.ceo/breeds/poodle-standard/n02113799_2280.jpg"
+
+def get_random_fact():
+    """Интересный факт"""
+    facts = [
+        "🐈 У кошек потеют только лапки.",
+        "🧠 Мозг человека потребляет около 20% всей энергии организма.",
+        "🚀 Скорость света составляет примерно 300 000 км/сек.",
+        "🦈 Акулы появились на Земле раньше, чем деревья.",
+        "🪐 На Венере сутки длятся дольше, чем один год.",
+        "💧 Вода — единственное вещество на Земле, которое расширяется при замерзании.",
+        "💡 Электрический стул был изобретен стоматологом."
+    ]
+    return random.choice(facts)
 
 # ============ УНИВЕРСАЛЬНЫЙ ПАРСИНГ ВВОДА ВК ============
 
@@ -577,7 +830,7 @@ def parse_vk_input(text):
             "message": post_message
         }
 
-    # --- 2. Поиск совпадения в начале сообщения (1, канал1, название) ---
+    # --- 2. Поиск совпадения в начале сообщения ---
     best_match = None
 
     for ch in channels:
@@ -609,14 +862,10 @@ def parse_vk_input(text):
 
             if text_str.lower().startswith(pref_lower):
                 rem = text_str[len(pref_lower):]
-                
-                # Если префикс состоит только из цифр (например "1"),
-                # проверяем, чтобы следующий символ не был еще одной цифрой (например "12")
                 if pref_lower.isdigit() and rem and rem[0].isdigit():
                     continue
 
                 rem_cleaned = re.sub(r'^[\s\-—–:]+', '', rem).strip()
-
                 match_len = len(pref_lower)
                 if best_match is None or match_len > best_match[0]:
                     best_match = (match_len, ch["id"], title, rem_cleaned)
@@ -630,7 +879,7 @@ def parse_vk_input(text):
             "message": msg
         }
 
-    # --- 3. Построчный разбор (первая строчка - канал) ---
+    # --- 3. Построчный разбор ---
     lines = text_str.split("\n")
     if len(lines) >= 1:
         first_line = lines[0].strip()
@@ -650,74 +899,164 @@ def parse_vk_input(text):
 
     return None
 
-# ============ ОБРАБОТКА КОМАНД ============
+# ============ ОБРАБОТКА КОМАНД В ВК ============
 
 def process_command(peer_id, text, msg_id=None):
     text_clean = text.strip()
     text_lower = text_clean.lower()
 
-    # 1. Служебные команды помощи
+    # 1. Помощь / Меню
     if text_lower in ["помощь", "help", "команды", "меню", "start", "старт"]:
         channels = get_channel_map()
         ch_list = []
         for ch in channels:
-            ch_list.append(f"• *{ch['title']}* (пишите: `{ch['index']}`, `канал{ch['index']}`, или `{ch['title']}`)")
+            ch_list.append(f"• *{ch['title']}* (пишите: `{ch['index']}` или `{ch['title']}`)")
 
         channels_str = "\n".join(ch_list) if ch_list else "⚠️ Каналы еще не найдены. Напишите `каналы` для автопоиска."
 
         return (
-            "📋 *ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ ПОСТОВ*\n\n"
-            "Вы можете отправлять посты любым удобным способом:\n\n"
-            "1️⃣ С переносом строки:\n"
-            "1\n"
-            "Мяу мяу\n\n"
-            "2️⃣ Через тире в одну строчку:\n"
-            "1 - Мяу мяу\n\n"
-            "3️⃣ Слитно:\n"
-            "1мяумяу\n\n"
-            "4️⃣ По ID канала:\n"
-            "-100123456789 - Мяу мяу\n\n"
-            f"📋 *Доступные каналы:*\n{channels_str}\n\n"
-            "⚙️ *Служебные команды:*\n"
-            "• `каналы` / `админ` — проверка списка каналов\n"
-            "• `стоп` / `старт` — пауза работы бота"
+            "📋 *ГЛАВНОЕ МЕНЮ И КОМАНДЫ (ВК БЕЗЛИМИТ)*\n\n"
+            "💬 *Публикация в Telegram (Фото, Видео, Аудио, Текст):*\n"
+            "• `1 - Привет всем!` (через тире)\n"
+            "• `1` и текст со 2-й строки\n"
+            "• Поддерживается отправка фото, видео и аудиофайлов из ВК прямо в ТГ!\n\n"
+            "🌐 *Интернет поиск:*\n"
+            "• Пример: `Интернет: Сколько лет котику`\n\n"
+            "📥 *Скачивание видео (YouTube / TikTok):*\n"
+            "• Пример: `Скачай https://youtube.com/shorts/...` или просто ссылка\n\n"
+            "🔍 *Парсер ТГ каналов (даже без бота в канале):*\n"
+            "• Пример: `Парси https://t.me/rian_ru`\n\n"
+            "🌤 *Крутые команды:*\n"
+            "• `погода [город]` (например: `погода Москва`)\n"
+            "• `котик` / `котики` — случайная картинка котика\n"
+            "• `собака` / `песель` — случайная собачка\n"
+            "• `факт` — интересный факт\n\n"
+            f"📋 *Сохраненные каналы:*\n{channels_str}\n\n"
+            "⚙️ *Служебные:* `каналы`, `стоп`, `старт`"
         )
 
     if text_lower in ["админ", "admin", "каналы", "channels", "статус"]:
         return check_tg_bot_admin_status()
 
-    # 2. Проверка поста в Telegram
+    # 2. Интернет поиск
+    if text_lower.startswith("интернет:") or text_lower.startswith("поиск:"):
+        query = re.sub(r'^(интернет:|поиск:)\s*', '', text_clean, flags=re.IGNORECASE)
+        return internet_search(query)
+
+    # 3. Парсер внешних ТГ каналов
+    if text_lower.startswith("парси ") or text_lower.startswith("парсить ") or "t.me/" in text_lower:
+        match_url = re.search(r'(https?://t\.me/[^\s]+|t\.me/[^\s]+|@[a-zA-Z0-9_]+)', text_clean)
+        if match_url:
+            return parse_external_tg_channel(match_url.group(1))
+
+    # 4. Скачивание видео (YouTube / TikTok / Shorts)
+    if text_lower.startswith("скачай ") or text_lower.startswith("download ") or "youtube.com" in text_lower or "youtu.be" in text_lower or "tiktok.com" in text_lower:
+        match_url = re.search(r'(https?://[^\s]+)', text_clean)
+        if match_url:
+            v_url = match_url.group(1)
+            send_message(peer_id, "⏳ Скачиваю видео (YouTube/TikTok), подождите немного...")
+            send_typing(peer_id)
+            f_path = download_video_yt_dlp(v_url)
+            if f_path:
+                doc_att = upload_video_to_vk(peer_id, f_path)
+                try: os.remove(f_path)
+                except: pass
+                if doc_att:
+                    send_message(peer_id, "✅ Видео успешно скачано и загружено!", attachment=doc_att)
+                    return ""
+                else:
+                    return "❌ Ошибка загрузки скачанного видео в ВК."
+            else:
+                return "❌ Не удалось скачать видео по этой ссылке. Проверьте правильность URL или доступность."
+
+    # 5. Погода
+    if text_lower.startswith("погода") or text_lower.startswith("weather"):
+        city = re.sub(r'^(погода|weather)\s*', '', text_clean, flags=re.IGNORECASE).strip()
+        if not city:
+            city = "Москва"
+        return get_weather(city)
+
+    # 6. Случайный котик
+    if text_lower in ["котик", "котики", "кот", "cat", "cats"]:
+        c_url = get_random_cat()
+        if c_url.startswith("http"):
+            # Загружаем картинку котика как фото в ВК
+            send_message(peer_id, "🐾 Вот случайный котик для вас:", attachment=upload_photo_to_vk_from_url(peer_id, c_url))
+            return ""
+        return c_url
+
+    # 7. Случайная собачка
+    if text_lower in ["собака", "собачка", "песель", "dog"]:
+        d_url = get_random_dog()
+        if d_url.startswith("http"):
+            send_message(peer_id, "🐶 Вот случайный песель:", attachment=upload_photo_to_vk_from_url(peer_id, d_url))
+            return ""
+        return d_url
+
+    # 8. Интересный факт
+    if text_lower in ["факт", "факты", "fact"]:
+        return get_random_fact()
+
+    # 9. Проверка поста в Telegram (с фото, видео, аудио)
     parsed = parse_vk_input(text_clean)
     if parsed:
-        photos, videos = get_vk_message_attachments(msg_id)
+        photos, videos, audios = get_vk_message_attachments(msg_id)
 
         if parsed["action"] == "post":
-            ok, res_text = send_tg_channel_post(parsed["chat_id"], parsed["message"], photos=photos)
+            ok, res_text = send_tg_channel_post(
+                parsed["chat_id"], 
+                parsed["message"], 
+                photos=photos, 
+                videos=videos, 
+                audios=audios
+            )
             return res_text
 
-        elif parsed["action"] == "post_custom":
-            ok, res_text = send_tg_channel_post(parsed["chat_id"], parsed["message"], photos=photos)
-            return res_text
-
-    # 3. Если канал не распознан — показываем четкую справку
+    # 10. Если канал не распознан — проверяем не хотел ли пользователь что-то найти
     first_line = text_clean.split("\n")[0].strip()
     channels = get_channel_map()
     if channels:
         ch_list = [f"• `{ch['index']}` или `{ch['title']}`" for ch in channels]
         ch_str = "\n".join(ch_list)
     else:
-        ch_str = "⚠️ Ни один канал пока не найден! Напишите `каналы` для запуска автопоиска."
+        ch_str = "⚠️ Ни один канал пока не найден! Напишите `каналы` для автопоиска."
 
     return (
         f"❌ *Канал '{first_line}' не найден!*\n\n"
         "💡 *Примеры правильного ввода:*\n"
-        "• `1 - Мяу мяу`\n"
-        "• `1мяумяу`\n"
-        "• `1` (и со 2-й строчки текст)\n"
-        "• `-100123456789 - Мяу мяу`\n\n"
-        f"📋 *Доступные номера и названия каналов:*\n{ch_str}\n\n"
-        "💡 Напишите `каналы`, чтобы посмотреть все доступные каналы!"
+        "• `1 - Привет всем!`\n"
+        "• `Интернет: Курс биткоина`\n"
+        "• `погода Санкт-Петербург`\n"
+        "• `котик`\n\n"
+        f"📋 *Доступные каналы:*\n{ch_str}\n\n"
+        "💡 Напишите `помощь` для полного списка команд!"
     )
+
+def upload_photo_to_vk_from_url(peer_id, image_url):
+    """Вспомогательная функция для загрузки рандомных картинок в ВК"""
+    try:
+        r = requests.get(image_url, timeout=10)
+        if r.status_code != 200:
+            return ""
+        srv = vk_api("photos.getMessagesUploadServer", {"peer_id": peer_id})
+        if not srv or "response" not in srv:
+            return ""
+        upload_url = srv["response"]["upload_url"]
+        
+        files = {"photo": ("cat.jpg", r.content, "image/jpeg")}
+        up_resp = requests.post(upload_url, files=files, timeout=15).json()
+        
+        saved = vk_api("photos.saveMessagesPhoto", {
+            "server": up_resp.get("server"),
+            "photo": up_resp.get("photo"),
+            "hash": up_resp.get("hash")
+        })
+        if saved and "response" in saved:
+            p = saved["response"][0]
+            return f"photo{p['owner_id']}_{p['id']}"
+    except Exception as e:
+        log.error(f"❌ Ошибка загрузки фото в ВК: {e}")
+    return ""
 
 # ============ LONG POLL ЦИКЛ СЛУШАНИЯ ВК ============
 
@@ -766,20 +1105,11 @@ def listen_messages(user_id):
                     ts_msg = update[4]
                     text = update[5]
 
-                    # Пропускаем исходящие
-                    if flags & 2:
-                        continue
+                    if flags & 2: continue
+                    if peer_id != user_id: continue
+                    if ts_msg < start_timestamp - 10: continue
 
-                    # Только сообщения от владельца
-                    if peer_id != user_id:
-                        continue
-
-                    # Пропускаем старые сообщения до запуска
-                    if ts_msg < start_timestamp - 10:
-                        continue
-
-                    # Игнорируем ответы самого бота
-                    if any(text.startswith(prefix) for prefix in ["✅", "❌", "🛡", "🤖", "📋", "💡"]):
+                    if any(text.startswith(prefix) for prefix in ["✅", "❌", "🛡", "🤖", "📋", "💡", "🌐", "🌤", "🐾", "🐶", "⏳"]):
                         continue
 
                     text_lower = text.lower().strip()
@@ -792,8 +1122,7 @@ def listen_messages(user_id):
                         send_message(peer_id, "▶️ Бот возобновил работу!")
                         continue
 
-                    if BOT_PAUSED:
-                        continue
+                    if BOT_PAUSED: continue
 
                     log.info(f"📩 ВК сообщение от пользователя: {text[:50]}...")
                     send_typing(peer_id)
@@ -807,7 +1136,6 @@ def listen_messages(user_id):
             time.sleep(5)
 
 def start_tg_background_poller():
-    """Фоновый поток постоянного автоопределения Telegram обновлений"""
     def poll_loop():
         while True:
             try:
@@ -859,8 +1187,8 @@ HTML_PAGE = """
 </head>
 <body>
     <div class="card">
-        <h1>🚀 VK -> TG Автопостинг</h1>
-        <p class="desc">Настрой каналы один раз и отправляй посты простыми сообщениями из ВК!</p>
+        <h1>🚀 VK -> TG Автопостинг 2026</h1>
+        <p class="desc">Все каналы сохраняются автоматически, поддержка видео/аудио, интернет поиск и погода!</p>
         
         <form id="cfgForm">
             <div class="section-title">1. VK Авторизация</div>
@@ -937,7 +1265,7 @@ HTML_PAGE = """
                 const res = await resp.json();
                 if (res.ok) {
                     status.className = 'status ok';
-                    status.innerHTML = '✅ <b>Настройки успешно сохранены!</b><br>👤 ВК: ' + res.name + ' (ID: ' + res.user_id + ')<br>💬 Напишите "каналы" в личку ВК!';
+                    status.innerHTML = '✅ <b>Настройки успешно сохранены!</b><br>👤 ВК: ' + res.name + ' (ID: ' + res.user_id + ')<br>💬 Напишите "помощь" в личку ВК!';
                 } else {
                     status.className = 'status err';
                     status.textContent = '❌ ' + res.error;
@@ -1018,6 +1346,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"ok": True, "user_id": user_id, "name": name}).encode("utf-8"))
 
             except Exception as e:
+                self.send_source_error = str(e)
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1035,14 +1364,14 @@ def start_web_server():
 # ============ ОСНОВНОЙ ВХОД ============
 
 if __name__ == "__main__":
-    log.info("🚀 Запуск VK -> Telegram автопостинг бота...")
+    log.info("🚀 Запуск VK -> Telegram автопостинг бота (2026)...")
     cfg = load_config()
 
     if VK_TOKEN:
         user_id = get_user_id()
         if user_id:
             BOT_THREAD_STARTED = True
-            start_tg_background_poller()
+            start_tg_background_per = start_tg_background_poller()
             def start_bot():
                 listen_messages(user_id)
             bot_thread = threading.Thread(target=start_bot, daemon=True)
