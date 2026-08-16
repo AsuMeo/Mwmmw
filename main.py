@@ -19,14 +19,89 @@ logging.basicConfig(
 log = logging.getLogger("vk-tg-bot")
 
 CONFIG_FILE = "/tmp/vk_config.json"
+DISCOVERED_CHANNELS_FILE = "/tmp/tg_discovered_channels.json"
 VK_API_VERSION = "5.199"
 
 # Глобальное состояние
 VK_TOKEN = ""
 TG_TOKEN = ""
-CHANNELS_CONFIG = {}  # {"1": {"name": "Канал1", "id": "-100..."}, "2": {"name": "Канал2", "id": "-100..."}}
-CHANNELS_MAP = {}     # lower_alias -> chat_id
+CHANNELS_CONFIG = {}  # Ручная настройка через веб-панель
+CHANNELS_MAP = {}     # Синонимы из веб-панели
+DISCOVERED_CHANNELS = {} # Автоматически найденные каналы в Telegram
 BOT_THREAD_STARTED = False
+TG_OFFSET = 0
+
+# ============ ХРАНЕНИЕ НАЙДЕННЫХ КАНАЛОВ TELEGRAM ============
+
+def load_discovered_channels():
+    global DISCOVERED_CHANNELS
+    if os.path.exists(DISCOVERED_CHANNELS_FILE):
+        try:
+            with open(DISCOVERED_CHANNELS_FILE, "r", encoding="utf-8") as f:
+                DISCOVERED_CHANNELS = json.load(f)
+        except Exception as e:
+            log.error(f"❌ Ошибка загрузки найденных каналов: {e}")
+
+def save_discovered_channels():
+    try:
+        with open(DISCOVERED_CHANNELS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DISCOVERED_CHANNELS, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"❌ Ошибка сохранения найденных каналов: {e}")
+
+def register_discovered_channel(chat, status=None):
+    """Добавляет или обновляет информацию о найденном канале/чате в TG"""
+    if not chat or not isinstance(chat, dict):
+        return
+    chat_id = str(chat.get("id", ""))
+    if not chat_id:
+        return
+    
+    title = chat.get("title") or chat.get("username") or f"Канал {chat_id}"
+    username = chat.get("username", "")
+    ctype = chat.get("type", "")
+
+    DISCOVERED_CHANNELS[chat_id] = {
+        "id": chat_id,
+        "title": title,
+        "username": username,
+        "type": ctype,
+        "status": status or "administrator",
+        "updated_at": time.time()
+    }
+    save_discovered_channels()
+    log.info(f"📢 Зафиксирован канал/чат TG: '{title}' ({chat_id})")
+
+def poll_tg_updates():
+    """Слушает обновления Telegram Bot API для автоопределения всех каналов бота"""
+    global TG_OFFSET
+    if not TG_TOKEN:
+        return
+    try:
+        res = tg_api("getUpdates", {
+            "offset": TG_OFFSET,
+            "timeout": 2,
+            "allowed_updates": ["my_chat_member", "chat_member", "channel_post", "message"]
+        })
+        if res.get("ok"):
+            updates = res.get("result", [])
+            for upd in updates:
+                TG_OFFSET = max(TG_OFFSET, upd["update_id"] + 1)
+                if "my_chat_member" in upd:
+                    mcm = upd["my_chat_member"]
+                    chat = mcm.get("chat", {})
+                    new_mem = mcm.get("new_chat_member", {})
+                    st = new_mem.get("status", "")
+                    if st in ["administrator", "creator", "member"]:
+                        register_discovered_channel(chat, st)
+                if "channel_post" in upd:
+                    chat = upd["channel_post"].get("chat", {})
+                    register_discovered_channel(chat)
+                if "message" in upd:
+                    chat = upd["message"].get("chat", {})
+                    register_discovered_channel(chat)
+    except Exception as e:
+        log.error(f"❌ Ошибка получения обновлений TG: {e}")
 
 # ============ УПРАВЛЕНИЕ КОНФИГУРАЦИЕЙ ============
 
@@ -49,7 +124,6 @@ def rebuild_channels_map(ch1_name, ch1_id, ch2_name, ch2_id):
         name1 = ch1_name.strip() if ch1_name else "Канал1"
         cid1 = ch1_id.strip()
         CHANNELS_CONFIG["1"] = {"name": name1, "id": cid1}
-        # Заносим варианты написания
         for key in [name1.lower(), name1.lower().replace(" ", ""), "канал1", "канал 1", "1", "первый"]:
             CHANNELS_MAP[key] = cid1
 
@@ -62,6 +136,7 @@ def rebuild_channels_map(ch1_name, ch1_id, ch2_name, ch2_id):
 
 def load_config():
     global VK_TOKEN, TG_TOKEN
+    load_discovered_channels()
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -101,6 +176,134 @@ def save_config_data(vk_token, tg_token, ch1_name, ch1_id, ch2_name, ch2_id, use
         log.info("💾 Конфигурация сохранена")
     except Exception as e:
         log.error(f"❌ Ошибка сохранения конфига: {e}")
+
+# ============ ДИНАМИЧЕСКИЙ ПОИСК И ОПРЕДЕЛЕНИЕ КАНАЛОВ ============
+
+def get_all_active_channels():
+    """Собирает и проверяет все каналы из автопоиска Telegram и из настроек"""
+    poll_tg_updates()
+    load_discovered_channels()
+
+    channels_list = []
+    seen_ids = set()
+
+    # 1. Сначала проверяем каналы из веб-конфига
+    for key, c_info in CHANNELS_CONFIG.items():
+        cid = str(c_info["id"]).strip()
+        if cid and cid not in seen_ids:
+            seen_ids.add(cid)
+            channels_list.append({
+                "id": cid,
+                "title": c_info["name"],
+                "username": "",
+                "source": "config"
+            })
+
+    # 2. Затем добавляем автоматически найденные в Telegram каналы
+    for cid, info in DISCOVERED_CHANNELS.items():
+        cid_str = str(cid).strip()
+        if cid_str and cid_str not in seen_ids:
+            seen_ids.add(cid_str)
+            channels_list.append({
+                "id": cid_str,
+                "title": info.get("title", f"Канал {cid_str}"),
+                "username": info.get("username", ""),
+                "source": "discovered"
+            })
+
+    # Проверяем статус в Telegram API для каждого канала
+    bot_id = None
+    if TG_TOKEN:
+        me_resp = tg_api("getMe")
+        if me_resp.get("ok"):
+            bot_id = me_resp.get("result", {}).get("id")
+
+    final_channels = []
+    for idx, ch in enumerate(channels_list, 1):
+        cid = ch["id"]
+        title = ch["title"]
+        status = "unknown"
+        if TG_TOKEN:
+            chat_resp = tg_api("getChat", {"chat_id": cid})
+            if chat_resp.get("ok"):
+                res = chat_resp.get("result", {})
+                title = res.get("title") or title
+                ch["username"] = res.get("username") or ch["username"]
+                if bot_id:
+                    mem_resp = tg_api("getChatMember", {"chat_id": cid, "user_id": bot_id})
+                    if mem_resp.get("ok"):
+                        status = mem_resp.get("result", {}).get("status", "unknown")
+            else:
+                status = "error"
+
+        ch["title"] = title
+        ch["status"] = status
+        ch["index"] = idx
+        final_channels.append(ch)
+
+    return final_channels
+
+def find_channel_by_input(input_str):
+    """Определяет ID канала Telegram по вводу пользователя (номер, название, ID, alias)"""
+    if not input_str:
+        return None, None
+
+    clean_str = input_str.strip()
+    lower_str = clean_str.lower()
+    no_spaces = lower_str.replace(" ", "")
+
+    # Прямой ввод ID (-100...)
+    if clean_str.startswith("-100") or (clean_str.startswith("-") and clean_str[1:].isdigit()):
+        return clean_str, f"Канал {clean_str}"
+
+    # Прямой ввод username (@канал)
+    if clean_str.startswith("@"):
+        return clean_str, clean_str
+
+    channels = get_all_active_channels()
+
+    # 1. Поиск по чистому номеру (1, 2, 3...)
+    if lower_str.isdigit():
+        idx = int(lower_str)
+        if 1 <= idx <= len(channels):
+            ch = channels[idx - 1]
+            return ch["id"], ch["title"]
+
+    # 2. Поиск по маске "канал 1", "канал1", "канал 2" и т.д.
+    m = re.match(r'^(?:канал|channel|чат|chat)[\s_]*(\d+)$', lower_str)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= len(channels):
+            ch = channels[idx - 1]
+            return ch["id"], ch["title"]
+
+    # 3. Поиск по карте CHANNELS_MAP из конфига
+    if lower_str in CHANNELS_MAP:
+        cid = CHANNELS_MAP[lower_str]
+        for ch in channels:
+            if ch["id"] == cid:
+                return cid, ch["title"]
+        return cid, clean_str
+
+    # 4. Точное совпадение названия канала или username
+    for ch in channels:
+        ch_title_lower = ch["title"].lower()
+        ch_user_lower = ch["username"].lower() if ch.get("username") else ""
+        if lower_str == ch_title_lower or lower_str == ch_user_lower or lower_str == f"@{ch_user_lower}":
+            return ch["id"], ch["title"]
+
+    # 5. Совпадение без пробелов
+    for ch in channels:
+        ch_title_nospaces = ch["title"].lower().replace(" ", "")
+        if no_spaces == ch_title_nospaces:
+            return ch["id"], ch["title"]
+
+    # 6. Вхождение подстроки в название
+    for ch in channels:
+        if lower_str in ch["title"].lower():
+            return ch["id"], ch["title"]
+
+    return None, None
 
 # ============ VK API ============
 
@@ -186,11 +389,10 @@ def tg_api(method, payload=None, token_override=None):
         return {"ok": False, "description": str(e)}
 
 def check_tg_bot_admin_status():
-    """Проверка доступности каналов Telegram бота"""
+    """Автоматическая проверка и вывод списка каналов Telegram, где бот админ"""
     if not TG_TOKEN:
         return "❌ Токен Telegram бота не настроен на сайте!"
 
-    log.info("🔍 Проверка каналов в Telegram...")
     me_resp = tg_api("getMe")
     if not me_resp.get("ok"):
         return f"❌ Ошибка токена Telegram бота:\n{me_resp.get('description')}"
@@ -199,32 +401,51 @@ def check_tg_bot_admin_status():
     bot_name = bot_info.get("first_name", "Bot")
     bot_user = bot_info.get("username", "bot")
 
+    channels = get_all_active_channels()
+
+    if not channels:
+        return (
+            f"🤖 *Бот Telegram:* {bot_name} (@{bot_user})\n\n"
+            "⚠️ *Каналы пока не найдены!*\n\n"
+            "💡 *Как подключить канал:*\n"
+            "1. Добавьте бота в ваш Telegram-канал как АДМИНИСТРАТОРА.\n"
+            "2. Опубликуйте любое сообщение в канале (или отправьте пост).\n"
+            "3. Повторно напишите команду `каналы` в чат ВК!\n\n"
+            "Также можно указать ID канала на веб-панели управления."
+        )
+
     reports = []
-    if not CHANNELS_CONFIG:
-        reports.append("⚠️ На сайте не добавлено ни одного канала!")
+    for ch in channels:
+        idx = ch["index"]
+        title = ch["title"]
+        cid = ch["id"]
+        st = ch["status"]
+        uname = f" (@{ch['username']})" if ch.get("username") else ""
 
-    for key, c_info in CHANNELS_CONFIG.items():
-        cid = c_info["id"]
-        cname = c_info["name"]
-        chat_resp = tg_api("getChat", {"chat_id": cid})
-        if chat_resp.get("ok"):
-            res = chat_resp.get("result", {})
-            title = res.get("title", cname)
-            
-            # Проверяем статус админа
-            mem_resp = tg_api("getChatMember", {"chat_id": cid, "user_id": bot_info.get("id")})
-            if mem_resp.get("ok"):
-                status = mem_resp.get("result", {}).get("status", "unknown")
-                if status in ["administrator", "creator"]:
-                    reports.append(f"📢 *{title}* (ВК команда: `{cname}` / `{key}`)\n🆔 ID: `{cid}`\n👑 Статус: АДМИНИСТРАТОР (Готов к публикациям)")
-                else:
-                    reports.append(f"⚠️ *{title}* (`{cid}`)\n⚙️ Статус: {status} — СДЕЛАЙТЕ БОТА АДМИНОМ!")
-            else:
-                reports.append(f"📌 *{title}* (`{cid}`): Успешно найден")
+        if st in ["administrator", "creator"]:
+            status_str = "👑 АДМИНИСТРАТОР (Готов к публикациям)"
+        elif st == "member":
+            status_str = "⚠️ УЧАСТНИК — Сделайте бота администратором канала!"
         else:
-            reports.append(f"❌ Канал '{cname}' (`{cid}`): {chat_resp.get('description', 'Ошибка доступа')}")
+            status_str = f"⚙️ Статус: {st}"
 
-    report = f"🤖 *Бот Telegram:* {bot_name} (@{bot_user})\n\n" + "\n\n".join(reports)
+        reports.append(
+            f"{idx}️⃣ *{title}*{uname}\n"
+            f"🆔 ID: `{cid}`\n"
+            f"📌 Варианты ввода на 1-й строке в ВК: `{idx}`, `канал{idx}`, `{title}`\n"
+            f"Статус: {status_str}"
+        )
+
+    report = (
+        f"🤖 *Бот Telegram:* {bot_name} (@{bot_user})\n"
+        f"📋 *Найдено подключенных каналов/чатов: {len(channels)}*\n\n" +
+        "\n\n".join(reports) +
+        "\n\n💬 *Как отправить пост в Telegram из ВК:*\n"
+        "Напишите на первой строчке номер или название канала, а со второй - текст поста!\n\n"
+        "📌 *Пример:*\n"
+        "1\n"
+        "Мя мяу"
+    )
     return report
 
 # ============ ЗАЩИТА ОТ СПАМА И ДУБЛЕЙ ============
@@ -334,15 +555,16 @@ def parse_vk_input(text):
     if not lines:
         return None
 
-    first_line = lines[0].lower().strip()
+    first_line = lines[0].strip()
 
-    # 1. Проверка предустановленных названий каналов (Канал1, Канал2 и т.д.)
-    if first_line in CHANNELS_MAP:
-        target_chat_id = CHANNELS_MAP[first_line]
+    # 1. Поиск канала по первой строчке
+    chat_id, channel_title = find_channel_by_input(first_line)
+    if chat_id:
         post_text = "\n".join(lines[1:])
         return {
             "action": "post",
-            "chat_id": target_chat_id,
+            "chat_id": chat_id,
+            "channel_title": channel_title,
             "message": post_text
         }
 
@@ -357,31 +579,32 @@ def parse_vk_input(text):
 
     return None
 
-# ============ ОБРАБОТКА КОМАНД (БЕЗ ПОИСКА В ИНТЕРНЕТЕ) ============
+# ============ ОБРАБОТКА КОМАНД ============
 
 def process_command(peer_id, text, msg_id=None):
     text_clean = text.strip()
     text_lower = text_clean.lower()
 
-    # 1. Проверка на служебные команды
+    # 1. Служебные команды помощи
     if text_lower in ["помощь", "help", "команды", "меню", "start", "старт"]:
+        channels = get_all_active_channels()
         ch_list = []
-        for k, v in CHANNELS_CONFIG.items():
-            ch_list.append(f"• *{v['name']}* (команда: `{v['name']}` или `{k}`)")
+        for ch in channels:
+            ch_list.append(f"• *{ch['title']}* (на первой строке пишите: `{ch['index']}` или `канал{ch['index']}` или `{ch['title']}`)")
 
-        channels_str = "\n".join(ch_list) if ch_list else "⚠️ Каналы еще не настроены на сайте!"
+        channels_str = "\n".join(ch_list) if ch_list else "⚠️ Каналы еще не найдены. Напишите `каналы` для автопоиска."
 
         return (
             "📋 *ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ ПОСТОВ*\n\n"
             "Чтобы сделать пост в Telegram, отправь сообщение в чат:\n\n"
-            " Название Канала\n"
-            " Текст вашего поста...\n\n"
+            "[Номер или Название Канала]\n"
+            "[Текст вашего поста...]\n\n"
             "📌 *Пример:*\n"
-            "Канал1\n"
-            "Мяу\n\n"
-            f"📋 *Настроенные каналы:*\n{channels_str}\n\n"
+            "1\n"
+            "Мя мяу\n\n"
+            f"📋 *Доступные каналы:*\n{channels_str}\n\n"
             "⚙️ *Служебные команды:*\n"
-            "• `каналы` / `админ` — проверка статуса бота в Telegram\n"
+            "• `каналы` / `админ` — автоматический поиск и проверка каналов Telegram\n"
             "• `стоп` / `старт` — пауза работы бота"
         )
 
@@ -401,19 +624,24 @@ def process_command(peer_id, text, msg_id=None):
             ok, res_text = send_tg_channel_post(parsed["chat_id"], parsed["message"], photos=photos)
             return res_text
 
-    # 3. ЕСЛИ КАНАЛ НЕ РАСПОЗНАН — ПОКАЗЫВАЕМ ЧЕТКУЮ ОШИБКУ (БЕЗ ПОИСКА В ИНТЕРНЕТЕ!)
+    # 3. Если канал не распознан — показываем четкую справку
     first_line = text_clean.split("\n")[0].strip()
-    ch_list = [f"• `{v['name']}` (или `{k}`)" for k, v in CHANNELS_CONFIG.items()]
-    ch_str = "\n".join(ch_list) if ch_list else "Каналы не настроены в веб-панели!"
+    channels = get_all_active_channels()
+    if channels:
+        ch_list = [f"• `{ch['index']}` или `канал{ch['index']}` — *{ch['title']}*" for ch in channels]
+        ch_str = "\n".join(ch_list)
+    else:
+        ch_str = "⚠️ Ни один канал пока не найден! Напишите `каналы` для запуска автопоиска."
 
     return (
         f"❌ *Канал '{first_line}' не найден!*\n\n"
-        "💡 *Как отправить пост:*\n"
-        "Укажи название канала на первой строке, а со второй - текст поста.\n\n"
+        "💡 *Как правильно отправить пост:*\n"
+        "Укажите номер или название канала на первой строчке, а со второй - текст поста.\n\n"
         "Пример:\n"
-        "`Канал1`\n"
-        "`Мяу`\n\n"
-        f"📋 *Доступные названия каналов:*\n{ch_str}"
+        "1\n"
+        "Мя мяу\n\n"
+        f"📋 *Доступные варианты каналов:*\n{ch_str}\n\n"
+        "💡 Напишите `каналы`, чтобы обновить список каналов Telegram!"
     )
 
 # ============ LONG POLL ЦИКЛ СЛУШАНИЯ ВК ============
@@ -503,6 +731,18 @@ def listen_messages(user_id):
             log.error(f"❌ Ошибка цикла LongPoll: {e}")
             time.sleep(5)
 
+def start_tg_background_poller():
+    """Фоновый поток постоянного автоопределения Telegram обновлений"""
+    def poll_loop():
+        while True:
+            try:
+                poll_tg_updates()
+            except Exception as e:
+                log.error(f"❌ Ошибка фона TG polling: {e}")
+            time.sleep(3)
+    t = threading.Thread(target=poll_loop, daemon=True)
+    t.start()
+
 # ============ ВЕБ-СЕРВЕР И ИНТЕРФЕЙС НАСТРОЙКИ ============
 
 HTML_PAGE = """
@@ -556,26 +796,26 @@ HTML_PAGE = """
             <label>Токен Telegram Бота</label>
             <input type="text" id="tg_token" placeholder="8476739947:AAHP..." required>
 
-            <div class="section-title">3. Привязка Каналов</div>
+            <div class="section-title">3. Привязка Каналов (Опционально)</div>
             <div class="grid-2">
                 <div>
                     <label>Канал 1 (Название в ВК)</label>
-                    <input type="text" id="ch1_name" value="Канал1" required>
+                    <input type="text" id="ch1_name" value="Канал1">
                 </div>
                 <div>
                     <label>Канал 1 ID Telegram</label>
-                    <input type="text" id="ch1_id" placeholder="-100xxxxxxxxx" required>
+                    <input type="text" id="ch1_id" placeholder="-100xxxxxxxxx">
                 </div>
             </div>
 
             <div class="grid-2">
                 <div>
                     <label>Канал 2 (Название в ВК)</label>
-                    <input type="text" id="ch2_name" value="Канал2" required>
+                    <input type="text" id="ch2_name" value="Канал2">
                 </div>
                 <div>
                     <label>Канал 2 ID Telegram</label>
-                    <input type="text" id="ch2_id" placeholder="-100yyyyyyyyy" required>
+                    <input type="text" id="ch2_id" placeholder="-100yyyyyyyyy">
                 </div>
             </div>
 
@@ -586,7 +826,6 @@ HTML_PAGE = """
     </div>
 
     <script>
-        // Загрузка существующих настроек при открытии
         fetch('/get_config').then(r => r.json()).then(data => {
             if (data.ok && data.cfg) {
                 if (data.cfg.vk_token) document.getElementById('vk_token').value = data.cfg.vk_token;
@@ -623,7 +862,7 @@ HTML_PAGE = """
                 const res = await resp.json();
                 if (res.ok) {
                     status.className = 'status ok';
-                    status.innerHTML = '✅ <b>Настройки успешно сохранены!</b><br>👤 ВК: ' + res.name + ' (ID: ' + res.user_id + ')<br>💬 Теперь напишите "помощь" в ВК в личку самому себе!';
+                    status.innerHTML = '✅ <b>Настройки успешно сохранены!</b><br>👤 ВК: ' + res.name + ' (ID: ' + res.user_id + ')<br>💬 Напишите "каналы" в личку ВК!';
                 } else {
                     status.className = 'status err';
                     status.textContent = '❌ ' + res.error;
@@ -672,7 +911,6 @@ class WebHandler(BaseHTTPRequestHandler):
             ch2_name = data.get("ch2_name", "Канал2")
             ch2_id = data.get("ch2_id", "").strip()
 
-            # Проверка токена ВК
             test_url = f"https://api.vk.com/method/users.get?access_token={vk_tok}&v=5.199"
             try:
                 r = requests.get(test_url, timeout=10)
@@ -693,6 +931,7 @@ class WebHandler(BaseHTTPRequestHandler):
 
                 if not BOT_THREAD_STARTED:
                     BOT_THREAD_STARTED = True
+                    start_tg_background_poller()
                     def start_bot():
                         listen_messages(user_id)
                     bot_thread = threading.Thread(target=start_bot, daemon=True)
@@ -728,6 +967,7 @@ if __name__ == "__main__":
         user_id = get_user_id()
         if user_id:
             BOT_THREAD_STARTED = True
+            start_tg_background_poller()
             def start_bot():
                 listen_messages(user_id)
             bot_thread = threading.Thread(target=start_bot, daemon=True)
