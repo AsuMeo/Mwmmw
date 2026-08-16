@@ -1,11 +1,7 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine
 
-# Устанавливаем системные зависимости (включая ffmpeg для скачивания видео с ютуб/тиктока)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# В Alpine пакеты ставятся за 2 секунды и весят в 10 раз меньше!
+RUN apk add --no-cache ffmpeg curl
 
 WORKDIR /app
 
